@@ -6,8 +6,22 @@ from PIL import Image, ImageDraw, ImageFont
 import textwrap
 import subprocess
 import json
+import logging # <--- NEW: Import logging module
+
+# --- Logging Configuration ---
+# This will make logs show up properly in Railway
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 
 # --- Constants and Configuration ---
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+WORKER_PUBLIC_URL = os.environ.get("WORKER_PUBLIC_URL")
+
+if not BOT_TOKEN or not WORKER_PUBLIC_URL:
+    raise ValueError("BOT_TOKEN and WORKER_PUBLIC_URL environment variables must be set!")
+
 COMP_WIDTH = 1080
 COMP_HEIGHT = 1920
 COMP_SIZE_STR = f"{COMP_WIDTH}x{COMP_HEIGHT}"
@@ -24,12 +38,6 @@ CAPTION_BG_COLOR = (255, 255, 255)
 DOWNLOAD_PATH = "downloads"
 OUTPUT_PATH = "outputs"
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-WORKER_PUBLIC_URL = os.environ.get("WORKER_PUBLIC_URL")
-
-if not BOT_TOKEN or not WORKER_PUBLIC_URL:
-    raise ValueError("BOT_TOKEN and WORKER_PUBLIC_URL environment variables must be set!")
-
 # --- Bot Initialization ---
 bot = telebot.TeleBot(BOT_TOKEN)
 user_data = {}
@@ -42,7 +50,7 @@ def cleanup_files(file_list):
             try:
                 os.remove(file_path)
             except OSError as e:
-                print(f"Error deleting file {file_path}: {e}")
+                logging.error(f"Error deleting file {file_path}: {e}")
 
 def create_directories():
     if not os.path.exists(DOWNLOAD_PATH):
@@ -50,6 +58,7 @@ def create_directories():
     if not os.path.exists(OUTPUT_PATH):
         os.makedirs(OUTPUT_PATH)
 
+# (The rest of your helper functions: get_media_dimensions, create_caption_image are unchanged)
 def get_media_dimensions(media_path, media_type):
     if media_type == 'image':
         with Image.open(media_path) as img:
@@ -78,11 +87,11 @@ def create_caption_image(text, media_width):
     img.save(caption_image_path)
     return caption_image_path, rect_height
 
-# --- Telegram Handlers ---
-
+# --- Telegram Handlers (Unchanged) ---
 @bot.message_handler(content_types=['photo', 'video'])
 def handle_media(message):
     chat_id = message.chat.id
+    # ... (rest of the function is the same)
     session = user_data.get(chat_id, {})
     if session.get('state') in ['downloading', 'processing']:
         bot.reply_to(message, "I'm currently busy with your last request. Please wait until it's finished!")
@@ -108,14 +117,16 @@ def handle_media(message):
         user_data[chat_id]['state'] = 'awaiting_caption'
         bot.edit_message_text("✅ Media received! Now, please send the top caption text.", chat_id, download_message.message_id)
     except Exception as e:
-        print(f"An error occurred in handle_media for chat {chat_id}: {e}")
+        logging.error(f"An error occurred in handle_media for chat {chat_id}: {e}")
         bot.edit_message_text(f"❌ An error occurred while processing your media. Please try sending it again.", chat_id, download_message.message_id)
         if chat_id in user_data:
             del user_data[chat_id]
 
+
 @bot.message_handler(func=lambda message: True)
 def handle_text(message):
     chat_id = message.chat.id
+    # ... (rest of the function is the same)
     session = user_data.get(chat_id, {})
     current_state = session.get('state')
     if current_state == 'awaiting_caption':
@@ -128,7 +139,9 @@ def handle_text(message):
         bot.reply_to(message, "I'm already processing your video. Please wait a moment!")
     else:
         bot.reply_to(message, "Please send an image or video first before sending a caption.")
-        
+
+
+# --- Upload Function (Unchanged) ---
 def upload_to_worker(file_path):
     """Uploads the video file to the Cloudflare Worker's /store_video endpoint."""
     try:
@@ -138,14 +151,13 @@ def upload_to_worker(file_path):
         headers = { "Content-Type": "application/octet-stream" }
         response = requests.post(store_url, headers=headers, data=video_data)
         response.raise_for_status()
-        print("Successfully uploaded video to worker.")
+        logging.info("Successfully uploaded video to worker.")
         return True
     except requests.exceptions.RequestException as e:
-        print(f"Error uploading to Cloudflare Worker: {e} - {e.response.text}")
+        logging.error(f"Error uploading to Cloudflare Worker: {e} - {e.response.text}")
         return False
 
-# --- Main Processing Function (MODIFIED) ---
-# --- Main Processing Function (REVISED AND FIXED) ---
+# --- Main Processing Function (MODIFIED WITH LOGGING) ---
 def process_video_with_ffmpeg(chat_id):
     session = user_data.get(chat_id)
     if not session or session.get('state') != 'processing':
@@ -156,22 +168,21 @@ def process_video_with_ffmpeg(chat_id):
     media_type = session.get('media_type')
     caption_text = session.get('caption')
     output_filepath = os.path.join(OUTPUT_PATH, f"output_{chat_id}.mp4")
-    caption_image_path = None # Initialize to prevent reference before assignment
+    caption_image_path = None
     
     if not media_path:
         bot.send_message(chat_id, "Error: Media file path was not found. Please start over.")
         if chat_id in user_data: del user_data[chat_id]
         return
         
-    # This message will be updated and then deleted.
     processing_message = bot.send_message(chat_id, "⚙️ Processing your video...")
     
     try:
-        # --- 1. FFmpeg Video Processing ---
+        logging.info(f"Starting video processing for chat {chat_id}")
         if media_type == 'image':
             media_w, media_h = get_media_dimensions(media_path, media_type)
             final_duration = IMAGE_DURATION
-        else: # video
+        else:
             media_w, media_h, final_duration = get_media_dimensions(media_path, media_type)
             
         caption_image_path, caption_height = create_caption_image(caption_text, COMP_WIDTH)
@@ -180,6 +191,7 @@ def process_video_with_ffmpeg(chat_id):
         media_y_pos = (COMP_HEIGHT / 2 - scaled_media_h / 2) + MEDIA_Y_OFFSET
         caption_y_pos = media_y_pos - caption_height
         
+        # ** A potential workaround: reduce threads to lower CPU/RAM spike **
         command = ['ffmpeg', '-y', '-f', 'lavfi', '-i', f'color=c={BACKGROUND_COLOR}:s={COMP_SIZE_STR}:d={final_duration}']
         if media_type == 'image':
              command.extend(['-loop', '1', '-t', str(final_duration)])
@@ -195,67 +207,56 @@ def process_video_with_ffmpeg(chat_id):
             map_args.extend(['-map', '[final_a]'])
             
         command.extend(['-filter_complex', filter_complex, *map_args])
+        command.extend(['-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '2', '-c:a', 'aac', '-b:a', '192k', '-r', str(FPS), '-pix_fmt', 'yuv420p', output_filepath])
         
-        # ** THE FIX IS ON THIS LINE **
-        command.extend(['-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '8', '-c:a', 'aac', '-b:a', '192k', '-r', str(FPS), '-pix_fmt', 'yuv420p', output_filepath])
-        
+        logging.info("Running FFmpeg command...")
         subprocess.run(command, check=True, capture_output=True, text=True)
+        logging.info("FFmpeg processing finished successfully.")
 
-        # --- 2. Prioritized Upload to Cloudflare Worker ---
         bot.edit_message_text("⬆️ Uploading for fast download...", chat_id, processing_message.message_id)
         success = upload_to_worker(output_filepath)
         
-        # --- 3. Deliver Link and Video Sequentially ---
-        bot.delete_message(chat_id, processing_message.message_id) # Clean up status message now
+        bot.delete_message(chat_id, processing_message.message_id)
 
         if success:
+            shortcut_name = "GetLatestVideo" 
+            shortcut_url_scheme = f"shortcuts://run-shortcut?name={shortcut_name}"
             
             message_text = (
-                "✅ Ready for fast download\\!\n"
+                "✅ Ready for fast download\\!\n\n"
+                f"Tap the link below to save to Photos:\n"
+                f"`{shortcut_url_scheme}`"
             )
             bot.send_message(chat_id, message_text, parse_mode="MarkdownV2")
-            
             bot.send_video(chat_id, open(output_filepath, 'rb'), caption="Telegram preview:")
         else:
             bot.send_message(chat_id, "❌ High-speed upload failed. Sending to Telegram directly.")
             bot.send_video(chat_id, open(output_filepath, 'rb'))
 
     except subprocess.CalledProcessError as e:
-        print(f"FFmpeg error for chat {chat_id}:\nSTDOUT: {e.stdout}\nSTDERR: {e.stderr}")
-        bot.send_message(chat_id, "An error occurred during video encoding. The media might be in an unusual format.")
+        logging.error(f"FFmpeg failed for chat {chat_id}:\nSTDOUT: {e.stdout}\nSTDERR: {e.stderr}")
+        bot.send_message(chat_id, "An error occurred during video encoding.")
 
     except Exception as e:
-        # On any failure, try to delete the status message before reporting the error
+        logging.error(f"A critical error occurred in process_video_with_ffmpeg: {e}", exc_info=True)
         try:
             bot.delete_message(chat_id, processing_message.message_id)
         except telebot.apihelper.ApiException:
-            pass # Ignore if it's already deleted or not found
-        
-        print(f"An error occurred during processing for chat {chat_id}: {e}")
+            pass
         bot.send_message(chat_id, f"An unexpected error occurred. Please try again.")
-
     finally:
-        # --- 4. Cleanup ---
-        files_to_clean = [media_path, caption_image_path, output_filepath]
-        cleanup_files(filter(None, files_to_clean))
+        cleanup_files([media_path, caption_image_path, output_filepath])
         if chat_id in user_data:
             del user_data[chat_id]
 
 # --- "Immortal" Main Bot Loop ---
 if __name__ == '__main__':
-    print("Starting bot...")
+    logging.info("Starting bot...")
     create_directories()
     while True:
         try:
-            print("Bot is alive and polling...")
+            logging.info("Bot is alive and polling...")
             bot.polling(none_stop=True, interval=0, timeout=20)
-        except requests.exceptions.ConnectionError as e:
-            print(f"Connection Error: {e}. Retrying in 15 seconds...")
-            time.sleep(15)
-        except telebot.apihelper.ApiException as e:
-            print(f"Telegram API Error: {e}. Retrying in 15 seconds...")
-            time.sleep(15)
         except Exception as e:
-            print(f"An unexpected error occurred: {e}")
-            print("Restarting the bot in 5 seconds...")
+            logging.error(f"Bot polling loop failed: {e}", exc_info=True)
             time.sleep(5)
