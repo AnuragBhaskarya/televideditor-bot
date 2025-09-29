@@ -9,8 +9,6 @@ import json
 import logging
 import base64
 import re
-import threading
-from flask import Flask, request
 
 # --- Logging Configuration ---
 logging.basicConfig(
@@ -23,14 +21,9 @@ logging.basicConfig(
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 WORKER_PUBLIC_URL = os.environ.get("WORKER_PUBLIC_URL")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-# --- OPTIMIZATION: Webhook configuration ---
-# This should be your server's public URL, e.g., "https://your-domain.com"
-SERVER_URL = os.environ.get("SERVER_URL") 
-WEBHOOK_URL = f"{SERVER_URL}/{BOT_TOKEN}"
 
-
-if not BOT_TOKEN or not WORKER_PUBLIC_URL or not GEMINI_API_KEY or not SERVER_URL:
-    raise ValueError("BOT_TOKEN, WORKER_PUBLIC_URL, GEMINI_API_KEY, and SERVER_URL environment variables must be set!")
+if not BOT_TOKEN or not WORKER_PUBLIC_URL or not GEMINI_API_KEY:
+    raise ValueError("BOT_TOKEN, WORKER_PUBLIC_URL, and GEMINI_API_KEY environment variables must be set!")
     
 
 COMP_WIDTH = 1080
@@ -49,17 +42,11 @@ CAPTION_BG_COLOR = (255, 255, 255)
 DOWNLOAD_PATH = "downloads"
 OUTPUT_PATH = "outputs"
 
-# --- Bot Initialization and Global State ---
+# --- Bot Initialization ---
 bot = telebot.TeleBot(BOT_TOKEN)
 user_data = {}
 
-# --- OPTIMIZATION: A lock to ensure only one FFmpeg process runs at a time ---
-PROCESSING_LOCK = threading.Lock()
-
-# --- OPTIMIZATION: Flask app for webhook ---
-app = Flask(__name__)
-
-# --- Helper Functions (largely unchanged) ---
+# --- Helper Functions ---
 
 def cleanup_files(file_list):
     for file_path in file_list:
@@ -96,12 +83,11 @@ def create_caption_image(text, media_width):
     draw = ImageDraw.Draw(img)
     draw.rectangle([(0, 0), (COMP_WIDTH, img_height)], fill=CAPTION_BG_COLOR)
     draw.multiline_text((COMP_WIDTH / 2, img_height / 2), wrapped_text, font=font, fill=CAPTION_TEXT_COLOR, anchor="mm", align="center")
-    # --- OPTIMIZATION: Use a more unique name to avoid potential thread conflicts ---
-    caption_image_path = os.path.join(OUTPUT_PATH, f"caption_{user_data.get('chat_id', 'temp')}_{int(time.time())}.png")
+    caption_image_path = os.path.join(OUTPUT_PATH, f"caption_{user_data.get('chat_id', 'temp')}.png")
     img.save(caption_image_path)
     return caption_image_path, rect_height
 
-# --- AI Integration: Helper Functions (unchanged) ---
+# --- AI Integration: Helper Functions ---
 
 def extract_frame_from_video(video_path, duration, chat_id):
     frame_path = os.path.join(OUTPUT_PATH, f"frame_{chat_id}.jpg")
@@ -152,7 +138,7 @@ IMPORTANT:
 - Do not give any other text or comments on your own except for the caption as your output so only write the caption—nothing else."""
 
     request_body = {"contents": [{"parts": [{"text": prompt}, {"inline_data": {"mime_type": "image/jpeg", "data": image_data}}]}]}
-    api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro-vision:generateContent?key={GEMINI_API_KEY}"
+    api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
     
     try:
         response = requests.post(api_url, headers={'Content-Type': 'application/json'}, json=request_body, timeout=60)
@@ -171,29 +157,20 @@ IMPORTANT:
 @bot.message_handler(content_types=['photo', 'video'])
 def handle_media(message):
     chat_id = message.chat.id
-    # --- OPTIMIZATION: Check the global lock first ---
-    if PROCESSING_LOCK.locked():
-        bot.reply_to(message, "I'm currently busy processing another request. Please try again in a moment.")
-        return
-
     if user_data.get(chat_id, {}).get('state') in ['downloading', 'processing']:
-        bot.reply_to(message, "I'm already working on a previous request from you. Please wait until it's finished.")
+        bot.reply_to(message, "I'm currently busy. Please wait until the current process is finished.")
         return
-
     user_data[chat_id] = {'state': 'downloading'}
     download_message = bot.reply_to(message, "⬇️ Media detected. Starting download...")
     try:
         if message.content_type == 'photo': file_id, media_type = message.photo[-1].file_id, 'image'
         elif message.content_type == 'video': file_id, media_type = message.video.file_id, 'video'
         user_data[chat_id]['media_type'] = media_type
-        
         file_info = bot.get_file(file_id)
         downloaded_file = bot.download_file(file_info.file_path)
-        
         file_extension = os.path.splitext(file_info.file_path)[1]
         save_path = os.path.join(DOWNLOAD_PATH, f"{chat_id}_{file_id}{file_extension}")
         with open(save_path, 'wb') as new_file: new_file.write(downloaded_file)
-        
         user_data[chat_id].update({'media_path': save_path, 'state': 'awaiting_caption'})
         bot.edit_message_text("✅ Media received! Now, please send the top caption text.", chat_id, download_message.message_id)
     except Exception as e:
@@ -205,14 +182,9 @@ def handle_media(message):
 def handle_text(message):
     chat_id = message.chat.id
     if user_data.get(chat_id, {}).get('state') == 'awaiting_caption':
-        user_data[chat_id].update({'caption': message.text})
-        
-        # --- OPTIMIZATION: Run the heavy processing in a separate thread ---
-        # Pass necessary data to the thread to avoid issues with the global `user_data` dict
-        thread = threading.Thread(target=process_video_with_ffmpeg, args=(chat_id, user_data[chat_id]))
-        thread.start()
-    else:
-        bot.reply_to(message, "Please send an image or video first.")
+        user_data[chat_id].update({'state': 'processing', 'caption': message.text})
+        process_video_with_ffmpeg(chat_id)
+    else: bot.reply_to(message, "Please send an image or video first.")
 
 def upload_to_worker(file_path):
     try:
@@ -227,31 +199,28 @@ def upload_to_worker(file_path):
         logging.error(f"Error uploading to Cloudflare Worker: {e}")
         return False
 
-# --- Main Processing Function ---
-def process_video_with_ffmpeg(chat_id, session_data):
-    # --- OPTIMIZATION: Acquire lock to signal that processing has started ---
-    if not PROCESSING_LOCK.acquire(blocking=False):
-        # This case should rarely happen due to the initial check, but it's a safeguard.
-        bot.send_message(chat_id, "Sorry, the processor is busy. Your request has been cancelled.")
+# --- Main Processing Function (Final Optimized Version) ---
+# --- Main Processing Function (Final Optimized Version with Bug Fix) ---
+def process_video_with_ffmpeg(chat_id):
+    session = user_data.get(chat_id, {})
+    if not session or session.get('state') != 'processing':
+        bot.send_message(chat_id, "A critical error occurred. Session was lost.")
         return
-
-    # Mark the user's state as processing
-    user_data[chat_id]['state'] = 'processing'
-
-    media_path = session_data.get('media_path')
+        
+    media_path = session.get('media_path')
     output_filepath = os.path.join(OUTPUT_PATH, f"output_{chat_id}.mp4")
     caption_image_path, frame_path = None, None
-    processing_message = bot.send_message(chat_id, "⚙️ Processing video... This may take a moment.")
+    processing_message = bot.send_message(chat_id, "⚙️ Processing video...")
     
     try:
         # 1. FFmpeg Video Processing
         logging.info(f"Starting video processing for chat {chat_id}")
-        media_type = session_data['media_type']
+        media_type = session['media_type']
         final_duration = IMAGE_DURATION
         if media_type == 'image': media_w, media_h = get_media_dimensions(media_path, media_type)
         else: media_w, media_h, final_duration = get_media_dimensions(media_path, media_type)
             
-        caption_image_path, caption_height = create_caption_image(session_data['caption'], COMP_WIDTH)
+        caption_image_path, caption_height = create_caption_image(session['caption'], COMP_WIDTH)
         scale_ratio = COMP_WIDTH / media_w
         scaled_media_h = int(media_h * scale_ratio)
         media_y_pos = (COMP_HEIGHT / 2 - scaled_media_h / 2) + MEDIA_Y_OFFSET
@@ -269,8 +238,8 @@ def process_video_with_ffmpeg(chat_id, session_data):
             map_args.extend(['-map', '[final_a]'])
         command.extend(['-filter_complex', filter_complex, *map_args])
         
-        # --- OPTIMIZATION: Changed preset from ultrafast to veryfast for better quality ---
-        command.extend(['-c:v', 'libx264', '-preset', 'veryfast', '-threads', '2', '-c:a', 'aac', '-b:a', '192k', '-r', str(FPS), '-pix_fmt', 'yuv420p', output_filepath])
+        # ** THE FIX IS ON THIS LINE: libx264 **
+        command.extend(['-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '2', '-c:a', 'aac', '-b:a', '192k', '-r', str(FPS), '-pix_fmt', 'yuv420p', output_filepath])
         
         subprocess.run(command, check=True, capture_output=True, text=True)
         logging.info("FFmpeg processing finished.")
@@ -284,7 +253,7 @@ def process_video_with_ffmpeg(chat_id, session_data):
         else:
             bot.send_message(chat_id, "⚠️ High-speed upload failed. Cannot generate AI caption.")
             bot.delete_message(chat_id, processing_message.message_id)
-            return
+            return # Exit if upload fails
 
         # 3. Generate AI Caption
         bot.edit_message_text("🤖 Generating AI caption...", chat_id, processing_message.message_id)
@@ -300,11 +269,13 @@ def process_video_with_ffmpeg(chat_id, session_data):
             logging.error("Could not extract frame for AI analysis.")
             bot.send_message(chat_id, "⚠️ Could not extract frame for AI analysis.")
 
+        # 4. Final Cleanup
         bot.delete_message(chat_id, processing_message.message_id)
 
     except subprocess.CalledProcessError as e:
+        # Provide detailed FFmpeg error log to Telegram
         logging.error(f"FFmpeg failed for chat {chat_id}:\nSTDOUT: {e.stdout}\nSTDERR: {e.stderr}")
-        error_details = f"FFmpeg Error:\n`{e.stderr[:1000]}`"
+        error_details = f"FFmpeg Error:\n`{e.stderr[:1000]}`" # Send first 1000 chars of error
         bot.send_message(chat_id, error_details, parse_mode="Markdown")
         try: bot.delete_message(chat_id, processing_message.message_id)
         except: pass
@@ -315,37 +286,21 @@ def process_video_with_ffmpeg(chat_id, session_data):
         except: pass
         bot.send_message(chat_id, "An unexpected error occurred. Please try again.")
     finally:
-        # 5. Cleanup Files and State
+        # 5. Cleanup Files
         files_to_clean = [media_path, caption_image_path, output_filepath]
         if media_type == 'video' and frame_path:
             files_to_clean.append(frame_path)
         cleanup_files(filter(None, files_to_clean))
         if chat_id in user_data: del user_data[chat_id]
-        
-        # --- OPTIMIZATION: Release the lock so other tasks can run ---
-        PROCESSING_LOCK.release()
-        logging.info(f"Processing finished for chat {chat_id}. Lock released.")
 
-# --- OPTIMIZATION: Webhook route ---
-@app.route(f'/{BOT_TOKEN}', methods=['POST'])
-def webhook():
-    if request.headers.get('content-type') == 'application/json':
-        json_string = request.get_data().decode('utf-8')
-        update = telebot.types.Update.de_json(json_string)
-        bot.process_new_updates([update])
-        return '', 200
-    else:
-        return 'Unsupported Media Type', 415
-
-# --- "Immortal" Main Bot Loop (Replaced with Webserver) ---
+# --- "Immortal" Main Bot Loop ---
 if __name__ == '__main__':
     logging.info("Starting bot...")
     create_directories()
-    # Set the webhook
-    bot.remove_webhook()
-    time.sleep(0.5)
-    bot.set_webhook(url=WEBHOOK_URL)
-    logging.info(f"Webhook set to {WEBHOOK_URL}")
-    # Start the Flask server
-    # In production, use a proper WSGI server like Gunicorn or uWSGI
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
+    while True:
+        try:
+            logging.info("Bot is alive and polling...")
+            bot.polling(none_stop=True, interval=0, timeout=20)
+        except Exception as e:
+            logging.error(f"Bot polling loop failed: {e}", exc_info=True)
+            time.sleep(5)
