@@ -21,9 +21,10 @@ logging.basicConfig(
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 WORKER_PUBLIC_URL = os.environ.get("WORKER_PUBLIC_URL")
 
+
 if not BOT_TOKEN or not WORKER_PUBLIC_URL:
     raise ValueError("BOT_TOKEN and WORKER_PUBLIC_URL environment variables must be set!") 
-    
+
 
 COMP_WIDTH = 1080
 COMP_HEIGHT = 1920
@@ -94,6 +95,7 @@ def extract_frame_from_video(video_path, duration, chat_id):
     command = ['ffmpeg', '-y', '-i', video_path, '-ss', str(midpoint), '-vframes', '1', frame_path]
     try:
         subprocess.run(command, check=True, capture_output=True, text=True)
+        logging.info(f"Successfully extracted frame to {frame_path}")
         return frame_path
     except subprocess.CalledProcessError as e:
         logging.error(f"FFmpeg frame extraction failed: {e.stderr}")
@@ -107,12 +109,12 @@ def trigger_ai_caption_worker(frame_path, chat_id):
     try:
         with open(frame_path, "rb") as image_file:
             image_data = base64.b64encode(image_file.read()).decode('utf-8')
-        
+
         payload = {
             "chat_id": chat_id,
             "image_data": image_data
         }
-        
+
         # We send the request but don't wait for a response (fire and forget)
         # The worker will send the caption directly to the user.
         requests.post(worker_url, json=payload, timeout=10) # 10-second timeout is plenty
@@ -177,12 +179,12 @@ def process_video_with_ffmpeg(chat_id):
     if not session or session.get('state') != 'processing':
         bot.send_message(chat_id, "A critical error occurred. Session was lost.")
         return
-        
+
     media_path = session.get('media_path')
     output_filepath = os.path.join(OUTPUT_PATH, f"output_{chat_id}.mp4")
     caption_image_path, frame_path = None, None
     processing_message = bot.send_message(chat_id, "⚙️ Processing video...")
-    
+
     try:
         # 1. FFmpeg Video Processing
         logging.info(f"Starting video processing for chat {chat_id}")
@@ -190,13 +192,13 @@ def process_video_with_ffmpeg(chat_id):
         final_duration = IMAGE_DURATION
         if media_type == 'image': media_w, media_h = get_media_dimensions(media_path, media_type)
         else: media_w, media_h, final_duration = get_media_dimensions(media_path, media_type)
-            
+
         caption_image_path, caption_height = create_caption_image(session['caption'], COMP_WIDTH)
         scale_ratio = COMP_WIDTH / media_w
         scaled_media_h = int(media_h * scale_ratio)
         media_y_pos = (COMP_HEIGHT / 2 - scaled_media_h / 2) + MEDIA_Y_OFFSET
         caption_y_pos = media_y_pos - caption_height
-        
+
         command = ['ffmpeg', '-y', '-f', 'lavfi', '-i', f'color=c={BACKGROUND_COLOR}:s={COMP_SIZE_STR}:d={final_duration}']
         if media_type == 'image': command.extend(['-loop', '1', '-t', str(final_duration)])
         command.extend(['-i', media_path, '-i', caption_image_path])
@@ -209,7 +211,7 @@ def process_video_with_ffmpeg(chat_id):
             map_args.extend(['-map', '[final_a]'])
         command.extend(['-filter_complex', filter_complex, *map_args])
         command.extend(['-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '2', '-c:a', 'aac', '-b:a', '192k', '-r', str(FPS), '-pix_fmt', 'yuv420p', output_filepath])
-        
+
         subprocess.run(command, check=True, capture_output=True, text=True)
         logging.info("FFmpeg processing finished.")
 
@@ -226,9 +228,13 @@ def process_video_with_ffmpeg(chat_id):
 
         # 3. Trigger AI Caption Generation on Worker
         bot.edit_message_text("🤖 Requesting AI caption from our servers...", chat_id, processing_message.message_id)
-        if media_type == 'image': frame_path = media_path
-        else: frame_path = extract_frame_from_video(output_filepath, final_duration, chat_id)
         
+        # --- START OF FIX ---
+        # ALWAYS extract the frame from the FINAL rendered video, not the original input.
+        logging.info(f"Extracting frame from final video: {output_filepath}")
+        frame_path = extract_frame_from_video(output_filepath, final_duration, chat_id)
+        # --- END OF FIX ---
+
         if frame_path:
             if not trigger_ai_caption_worker(frame_path, chat_id):
                 bot.send_message(chat_id, "⚠️ Could not send frame to the AI for analysis.")
@@ -254,8 +260,11 @@ def process_video_with_ffmpeg(chat_id):
     finally:
         # 5. Cleanup Files
         files_to_clean = [media_path, caption_image_path, output_filepath]
-        if media_type == 'video' and frame_path:
+        # --- START OF FIX ---
+        # A frame is now always extracted, so it must always be cleaned up.
+        if frame_path:
             files_to_clean.append(frame_path)
+        # --- END OF FIX ---
         cleanup_files(filter(None, files_to_clean))
         if chat_id in user_data: del user_data[chat_id]
 
