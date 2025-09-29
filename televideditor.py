@@ -20,10 +20,9 @@ logging.basicConfig(
 # --- Constants and Configuration ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 WORKER_PUBLIC_URL = os.environ.get("WORKER_PUBLIC_URL")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-if not BOT_TOKEN or not WORKER_PUBLIC_URL or not GEMINI_API_KEY:
-    raise ValueError("BOT_TOKEN, WORKER_PUBLIC_URL, and GEMINI_API_KEY environment variables must be set!")
+if not BOT_TOKEN or not WORKER_PUBLIC_URL:
+    raise ValueError("BOT_TOKEN and WORKER_PUBLIC_URL environment variables must be set!") 
     
 
 COMP_WIDTH = 1080
@@ -100,58 +99,31 @@ def extract_frame_from_video(video_path, duration, chat_id):
         logging.error(f"FFmpeg frame extraction failed: {e.stderr}")
         return None
 
-def generate_ai_caption(frame_path):
-    with open(frame_path, "rb") as image_file:
-        image_data = base64.b64encode(image_file.read()).decode('utf-8')
-
-    prompt = """You are a social media content expert specializing in educational and science content for Instagram.
-remember for the use cases this "-" should NOT be used in the beginning of each point (important) only should be used to separate the lines in a new line as i said exacly do that!
-Analyze this image and create a caption following this exact format:
-[Title (a great caption engaging or humorous to keep it real use modern day's slang language (not abusive ones) but reddit style comment using like fr, no cap, bro, bruh or emojis like skull emoji and all)]:
---------------------
-[Short engaging description/comment about what's shown in the image]
----------------------------------------
-➡️ Explanation:
-----------------
-[Detailed explanation of the concept, scientific principle, or educational content shown in the image. Make it informative but accessible.]
----------------------------------------
-➡️ Use Cases:
-----------------
-[3 practical applications or real-world examples.. with a point]
-- (do not forget to separate the line with this)
-[Use case 1 (do not use asterisks to highlight usecases as bold and do not add - at beginning)]
-- (do not forget to separate the line with this)
-[Use case 2 (do not use asterisks to highlight usecases as bold and do not add - at beginning)] 
-- (do not forget to separate the line with this)
-[Use case 3(do not use asterisks to highlight usecases as bold and do not add - at beginning)]
----------------------------------------
-#knowledgemaxxing #maxxing #aura #education #maxx #meme #memes #science #sciencememes #sciencefacts #sciencelover #fyp #explorepage
-IMPORTANT: 
-- Keep the exact format with the separators (-------) 
-- Do not use any * (asterisks) for bold formatting i need plain text
-- Make it engaging and educational
-- The tone should be informative but accessible to young adults
-- Explain the meme or anything I gave you as the image
-- Add relevant hashtags beyond the fixed ones based on what you see in the image
-- Focus on the educational or scientific aspect of the image
-- The caption format should be exactly like what I said.
-- Do not give any other text or comments on your own except for the caption as your output so only write the caption—nothing else."""
-
-    request_body = {"contents": [{"parts": [{"text": prompt}, {"inline_data": {"mime_type": "image/jpeg", "data": image_data}}]}]}
-    api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
-    
+def trigger_ai_caption_worker(frame_path, chat_id):
+    """
+    Sends the extracted frame and chat_id to the Cloudflare Worker to generate a caption.
+    """
+    worker_url = f"{WORKER_PUBLIC_URL}/get_pic"
     try:
-        response = requests.post(api_url, headers={'Content-Type': 'application/json'}, json=request_body, timeout=60)
-        response.raise_for_status()
-        result = response.json()
-        text = result.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', '')
-        return text.strip() if text else "❌ AI failed to generate a caption. The response was empty."
-    except requests.exceptions.HTTPError as e:
-        logging.error(f"HTTP error calling Gemini API: {e} - Response: {e.response.text}")
-        return f"❌ AI service returned an error: {e.response.status_code}"
+        with open(frame_path, "rb") as image_file:
+            image_data = base64.b64encode(image_file.read()).decode('utf-8')
+        
+        payload = {
+            "chat_id": chat_id,
+            "image_data": image_data
+        }
+        
+        # We send the request but don't wait for a response (fire and forget)
+        # The worker will send the caption directly to the user.
+        requests.post(worker_url, json=payload, timeout=10) # 10-second timeout is plenty
+        logging.info(f"Successfully sent frame to AI worker for chat_id: {chat_id}")
+        return True
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Failed to trigger AI caption worker: {e}")
+        return False
     except Exception as e:
-        logging.error(f"Error with Gemini API: {e}")
-        return "❌ AI response was not in the expected format or a connection error occurred."
+        logging.error(f"An unexpected error occurred in trigger_ai_caption_worker: {e}")
+        return False
 
 # --- Telegram Handlers & Upload Function ---
 @bot.message_handler(content_types=['photo', 'video'])
@@ -199,7 +171,6 @@ def upload_to_worker(file_path):
         logging.error(f"Error uploading to Cloudflare Worker: {e}")
         return False
 
-# --- Main Processing Function (Final Optimized Version) ---
 # --- Main Processing Function (Final Optimized Version with Bug Fix) ---
 def process_video_with_ffmpeg(chat_id):
     session = user_data.get(chat_id, {})
@@ -237,8 +208,6 @@ def process_video_with_ffmpeg(chat_id):
             filter_complex += ";[1:a]asetpts=PTS-STARTPTS[final_a]"
             map_args.extend(['-map', '[final_a]'])
         command.extend(['-filter_complex', filter_complex, *map_args])
-        
-        # ** THE FIX IS ON THIS LINE: libx264 **
         command.extend(['-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '2', '-c:a', 'aac', '-b:a', '192k', '-r', str(FPS), '-pix_fmt', 'yuv420p', output_filepath])
         
         subprocess.run(command, check=True, capture_output=True, text=True)
@@ -251,20 +220,18 @@ def process_video_with_ffmpeg(chat_id):
             message_text = (f"✅ Ready for fast download\\!\n\n")
             bot.send_message(chat_id, message_text, parse_mode="MarkdownV2")
         else:
-            bot.send_message(chat_id, "⚠️ High-speed upload failed. Cannot generate AI caption.")
+            bot.send_message(chat_id, "⚠️ High-speed upload failed. The AI caption cannot be generated.")
             bot.delete_message(chat_id, processing_message.message_id)
-            return # Exit if upload fails
+            return
 
-        # 3. Generate AI Caption
-        bot.edit_message_text("🤖 Generating AI caption...", chat_id, processing_message.message_id)
+        # 3. Trigger AI Caption Generation on Worker
+        bot.edit_message_text("🤖 Requesting AI caption from our servers...", chat_id, processing_message.message_id)
         if media_type == 'image': frame_path = media_path
         else: frame_path = extract_frame_from_video(output_filepath, final_duration, chat_id)
         
         if frame_path:
-            ai_caption = generate_ai_caption(frame_path)
-            logging.info("AI Caption generated.")
-            copyable_caption = f"✅ *AI Caption Generated:*\n\n```\n{ai_caption}\n```"
-            bot.send_message(chat_id, copyable_caption, parse_mode="Markdown")
+            if not trigger_ai_caption_worker(frame_path, chat_id):
+                bot.send_message(chat_id, "⚠️ Could not send frame to the AI for analysis.")
         else:
             logging.error("Could not extract frame for AI analysis.")
             bot.send_message(chat_id, "⚠️ Could not extract frame for AI analysis.")
@@ -273,9 +240,8 @@ def process_video_with_ffmpeg(chat_id):
         bot.delete_message(chat_id, processing_message.message_id)
 
     except subprocess.CalledProcessError as e:
-        # Provide detailed FFmpeg error log to Telegram
         logging.error(f"FFmpeg failed for chat {chat_id}:\nSTDOUT: {e.stdout}\nSTDERR: {e.stderr}")
-        error_details = f"FFmpeg Error:\n`{e.stderr[:1000]}`" # Send first 1000 chars of error
+        error_details = f"FFmpeg Error:\n`{e.stderr[:1000]}`"
         bot.send_message(chat_id, error_details, parse_mode="Markdown")
         try: bot.delete_message(chat_id, processing_message.message_id)
         except: pass
