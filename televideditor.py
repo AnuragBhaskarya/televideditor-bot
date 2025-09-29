@@ -33,9 +33,11 @@ FPS = 30
 IMAGE_DURATION = 8
 FADE_IN_DURATION = 6
 MEDIA_Y_OFFSET = 100
-CAPTION_V_PADDING = 40
-CAPTION_FONT_SIZE = 60
-CAPTION_FONT = "Inter_28pt-ExtraBold"
+CAPTION_V_PADDING = 37
+CAPTION_FONT_SIZE = 55
+CAPTION_TOP_PADDING_LINES = 0 # <--- NEW VARIABLE: Set this to 0, 1, 2, etc. for blank lines
+CAPTION_LINE_SPACING = 12
+CAPTION_FONT = "Montserrat-ExtraBold"
 CAPTION_TEXT_COLOR = (0, 0, 0)
 CAPTION_BG_COLOR = (255, 255, 255)
 DOWNLOAD_PATH = "downloads"
@@ -69,22 +71,44 @@ def get_media_dimensions(media_path, media_type):
         stream_data = data['streams'][0]
         return stream_data['width'], stream_data['height'], float(stream_data['duration'])
 
+# <--- MODIFIED FUNCTION ---
 def create_caption_image(text, media_width):
+    # Add the desired number of blank lines before the actual caption text
+    padded_text = ("\n" * CAPTION_TOP_PADDING_LINES) + text
+
     font_path = f"{CAPTION_FONT}.ttf"
     font = ImageFont.truetype(font_path, CAPTION_FONT_SIZE)
-    wrapped_lines = textwrap.wrap(text, width=30, break_long_words=True)
+    # Use the new padded_text for wrapping
+    wrapped_lines = textwrap.wrap(padded_text, width=30, break_long_words=True)
     wrapped_text = "\n".join(wrapped_lines)
-    text_bbox = ImageDraw.Draw(Image.new('RGB', (0,0))).multiline_textbbox((0, 0), wrapped_text, font=font, align="center")
+    
+    # Pass the spacing parameter to multiline_textbbox
+    text_bbox = ImageDraw.Draw(Image.new('RGB', (0,0))).multiline_textbbox(
+        (0, 0), wrapped_text, font=font, align="center", spacing=CAPTION_LINE_SPACING
+    )
+    
     text_height = text_bbox[3] - text_bbox[1]
     rect_height = text_height + (2 * CAPTION_V_PADDING)
     img_height = int(rect_height)
     img = Image.new('RGBA', (COMP_WIDTH, img_height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     draw.rectangle([(0, 0), (COMP_WIDTH, img_height)], fill=CAPTION_BG_COLOR)
-    draw.multiline_text((COMP_WIDTH / 2, img_height / 2), wrapped_text, font=font, fill=CAPTION_TEXT_COLOR, anchor="mm", align="center")
+    
+    # Pass the spacing parameter to multiline_text
+    draw.multiline_text(
+        (COMP_WIDTH / 2, img_height / 2),
+        wrapped_text,
+        font=font,
+        fill=CAPTION_TEXT_COLOR,
+        anchor="mm",
+        align="center",
+        spacing=CAPTION_LINE_SPACING
+    )
+    
     caption_image_path = os.path.join(OUTPUT_PATH, f"caption_{user_data.get('chat_id', 'temp')}.png")
     img.save(caption_image_path)
     return caption_image_path, rect_height
+# <--- END OF MODIFIED FUNCTION ---
 
 def extract_frame_from_video(video_path, duration, chat_id):
     frame_path = os.path.join(OUTPUT_PATH, f"frame_{chat_id}.jpg")
@@ -226,7 +250,7 @@ def process_video_with_ffmpeg(chat_id):
         bot.edit_message_text(error_details, chat_id, processing_message.message_id, parse_mode="Markdown")
     except Exception as e:
         logging.error(f"Error in process_video_with_ffmpeg: {e}", exc_info=True)
-        bot.edit_message_text("An unexpected error occurred. Please try again.", chat_id, processing_-message.message_id)
+        bot.edit_message_text("An unexpected error occurred. Please try again.", chat_id, processing_message.message_id)
     finally:
         # 5. Cleanup Files
         files_to_clean = [media_path, caption_image_path, output_filepath, frame_path]
