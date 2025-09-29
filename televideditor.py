@@ -21,9 +21,8 @@ logging.basicConfig(
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 WORKER_PUBLIC_URL = os.environ.get("WORKER_PUBLIC_URL")
 
-
 if not BOT_TOKEN or not WORKER_PUBLIC_URL:
-    raise ValueError("BOT_TOKEN and WORKER_PUBLIC_URL environment variables must be set!") 
+    raise ValueError("BOT_TOKEN and WORKER_PUBLIC_URL environment variables must be set!")
 
 
 COMP_WIDTH = 1080
@@ -33,7 +32,7 @@ BACKGROUND_COLOR = "black"
 FPS = 30
 IMAGE_DURATION = 8
 FADE_IN_DURATION = 6
-MEDIA_Y_OFFSET = 50
+MEDIA_Y_OFFSET = 100
 CAPTION_V_PADDING = 40
 CAPTION_FONT_SIZE = 60
 CAPTION_FONT = "Inter_28pt-ExtraBold"
@@ -87,8 +86,6 @@ def create_caption_image(text, media_width):
     img.save(caption_image_path)
     return caption_image_path, rect_height
 
-# --- AI Integration: Helper Functions ---
-
 def extract_frame_from_video(video_path, duration, chat_id):
     frame_path = os.path.join(OUTPUT_PATH, f"frame_{chat_id}.jpg")
     midpoint = duration / 2
@@ -101,33 +98,8 @@ def extract_frame_from_video(video_path, duration, chat_id):
         logging.error(f"FFmpeg frame extraction failed: {e.stderr}")
         return None
 
-def trigger_ai_caption_worker(frame_path, chat_id):
-    """
-    Sends the extracted frame and chat_id to the Cloudflare Worker to generate a caption.
-    """
-    worker_url = f"{WORKER_PUBLIC_URL}/get_pic"
-    try:
-        with open(frame_path, "rb") as image_file:
-            image_data = base64.b64encode(image_file.read()).decode('utf-8')
 
-        payload = {
-            "chat_id": chat_id,
-            "image_data": image_data
-        }
-
-        # We send the request but don't wait for a response (fire and forget)
-        # The worker will send the caption directly to the user.
-        requests.post(worker_url, json=payload, timeout=10) # 10-second timeout is plenty
-        logging.info(f"Successfully sent frame to AI worker for chat_id: {chat_id}")
-        return True
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Failed to trigger AI caption worker: {e}")
-        return False
-    except Exception as e:
-        logging.error(f"An unexpected error occurred in trigger_ai_caption_worker: {e}")
-        return False
-
-# --- Telegram Handlers & Upload Function ---
+# --- Telegram Handlers ---
 @bot.message_handler(content_types=['photo', 'video'])
 def handle_media(message):
     chat_id = message.chat.id
@@ -160,20 +132,38 @@ def handle_text(message):
         process_video_with_ffmpeg(chat_id)
     else: bot.reply_to(message, "Please send an image or video first.")
 
-def upload_to_worker(file_path):
+
+# --- NEW UPLOAD AND PROCESSING FUNCTION ---
+def upload_and_process(chat_id, video_path, frame_path):
+    """
+    Uploads the final video and the frame for AI captioning in a single request.
+    """
+    worker_url = f"{WORKER_PUBLIC_URL}/process"
     try:
-        with open(file_path, 'rb') as video_file: video_data = video_file.read()
-        store_url = f"{WORKER_PUBLIC_URL}/store_video"
-        headers = { "Content-Type": "application/octet-stream" }
-        response = requests.post(store_url, headers=headers, data=video_data, timeout=60)
-        response.raise_for_status()
-        logging.info("Successfully uploaded video to worker.")
+        with open(frame_path, "rb") as image_file:
+            image_data = base64.b64encode(image_file.read()).decode('utf-8')
+
+        with open(video_path, 'rb') as video_file:
+            files = {
+                'video': ('final_video.mp4', video_file, 'video/mp4'),
+                'image_data': (None, image_data),
+                'chat_id': (None, str(chat_id))
+            }
+            # The worker will respond quickly, but the full process runs in the background
+            response = requests.post(worker_url, files=files, timeout=30)
+            response.raise_for_status()
+            
+        logging.info("Successfully sent video and frame to worker for processing.")
         return True
     except requests.exceptions.RequestException as e:
         logging.error(f"Error uploading to Cloudflare Worker: {e}")
         return False
+    except Exception as e:
+        logging.error(f"An unexpected error occurred in upload_and_process: {e}")
+        return False
 
-# --- Main Processing Function (Final Optimized Version with Bug Fix) ---
+
+# --- Main Processing Function ---
 def process_video_with_ffmpeg(chat_id):
     session = user_data.get(chat_id, {})
     if not session or session.get('state') != 'processing':
@@ -183,7 +173,7 @@ def process_video_with_ffmpeg(chat_id):
     media_path = session.get('media_path')
     output_filepath = os.path.join(OUTPUT_PATH, f"output_{chat_id}.mp4")
     caption_image_path, frame_path = None, None
-    processing_message = bot.send_message(chat_id, "⚙️ Processing video...")
+    processing_message = bot.send_message(chat_id, "⚙️ Processing your video...")
 
     try:
         # 1. FFmpeg Video Processing
@@ -215,56 +205,31 @@ def process_video_with_ffmpeg(chat_id):
         subprocess.run(command, check=True, capture_output=True, text=True)
         logging.info("FFmpeg processing finished.")
 
-        # 2. Upload to Worker for Fast Download
-        bot.edit_message_text("⬆️ Uploading for fast download...", chat_id, processing_message.message_id)
-        if upload_to_worker(output_filepath):
-            shortcut_name = "GetLatestVideo"
-            message_text = (f"✅ Ready for fast download\\!\n\n")
-            bot.send_message(chat_id, message_text, parse_mode="MarkdownV2")
-        else:
-            bot.send_message(chat_id, "⚠️ High-speed upload failed. The AI caption cannot be generated.")
-            bot.delete_message(chat_id, processing_message.message_id)
-            return
-
-        # 3. Trigger AI Caption Generation on Worker
-        bot.edit_message_text("🤖 Requesting AI caption from our servers...", chat_id, processing_message.message_id)
-        
-        # --- START OF FIX ---
-        # ALWAYS extract the frame from the FINAL rendered video, not the original input.
-        logging.info(f"Extracting frame from final video: {output_filepath}")
+        # 2. Extract frame for AI
+        bot.edit_message_text("⬆️ Uploading and processing...", chat_id, processing_message.message_id)
         frame_path = extract_frame_from_video(output_filepath, final_duration, chat_id)
-        # --- END OF FIX ---
-
+        
+        # 3. Upload everything to the worker
         if frame_path:
-            if not trigger_ai_caption_worker(frame_path, chat_id):
-                bot.send_message(chat_id, "⚠️ Could not send frame to the AI for analysis.")
+            if not upload_and_process(chat_id, output_filepath, frame_path):
+                bot.send_message(chat_id, "⚠️ Upload to our servers failed. Please try again.")
         else:
             logging.error("Could not extract frame for AI analysis.")
-            bot.send_message(chat_id, "⚠️ Could not extract frame for AI analysis.")
+            bot.send_message(chat_id, "⚠️ Could not prepare video for AI analysis.")
 
-        # 4. Final Cleanup
-        bot.delete_message(chat_id, processing_message.message_id)
+        # 4. Final Bot Message
+        bot.edit_message_text("✅ Done! GC will arrive shortly.", chat_id, processing_message.message_id)
 
     except subprocess.CalledProcessError as e:
         logging.error(f"FFmpeg failed for chat {chat_id}:\nSTDOUT: {e.stdout}\nSTDERR: {e.stderr}")
         error_details = f"FFmpeg Error:\n`{e.stderr[:1000]}`"
-        bot.send_message(chat_id, error_details, parse_mode="Markdown")
-        try: bot.delete_message(chat_id, processing_message.message_id)
-        except: pass
-
+        bot.edit_message_text(error_details, chat_id, processing_message.message_id, parse_mode="Markdown")
     except Exception as e:
         logging.error(f"Error in process_video_with_ffmpeg: {e}", exc_info=True)
-        try: bot.delete_message(chat_id, processing_message.message_id)
-        except: pass
-        bot.send_message(chat_id, "An unexpected error occurred. Please try again.")
+        bot.edit_message_text("An unexpected error occurred. Please try again.", chat_id, processing_-message.message_id)
     finally:
         # 5. Cleanup Files
-        files_to_clean = [media_path, caption_image_path, output_filepath]
-        # --- START OF FIX ---
-        # A frame is now always extracted, so it must always be cleaned up.
-        if frame_path:
-            files_to_clean.append(frame_path)
-        # --- END OF FIX ---
+        files_to_clean = [media_path, caption_image_path, output_filepath, frame_path]
         cleanup_files(filter(None, files_to_clean))
         if chat_id in user_data: del user_data[chat_id]
 
