@@ -1,3 +1,5 @@
-pytelegrambotapi
-pillow
+pyTelegramBotAPI
 requests
+Pillow
+Flask
+gunicorn
