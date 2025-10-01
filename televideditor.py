@@ -235,15 +235,25 @@ def isolated_video_processing_task(chat_id, media_path, media_type, caption_text
         scale_ratio = COMP_WIDTH / media_w
         scaled_media_h = int(media_h * scale_ratio)
         media_y_pos = (COMP_HEIGHT / 2 - scaled_media_h / 2) + MEDIA_Y_OFFSET
-        caption_y_pos = media_y_pos - caption_height
+        
+        # --- FIX: PIXEL GAP ---
+        # Add 1 to the caption's Y position to create a 1px overlap, ensuring no visible gap due to rounding.
+        caption_y_pos = media_y_pos - caption_height + 1
 
         # 3. Build and run FFmpeg command
         command = ['ffmpeg', '-y', '-f', 'lavfi', '-i', f'color=c={BACKGROUND_COLOR}:s={COMP_SIZE_STR}:d={final_duration}']
         if media_type == 'image': command.extend(['-loop', '1', '-t', str(final_duration)])
         command.extend(['-i', media_path, '-i', caption_image_path])
-        filter_complex = (f"[1:v]scale={COMP_WIDTH}:-1,setpts=PTS-STARTPTS,fade=t=in:st=0:d={FADE_IN_DURATION}[media];"
-                          f"[0:v][media]overlay=(W-w)/2:{media_y_pos}[bg_with_media];"
+
+        # --- MODIFIED: FADE-IN EFFECT ---
+        # The filter chain now adds an alpha channel (`format=yuva420p`) and then fades that alpha channel (`fade=...:alpha=1`).
+        # This creates a much smoother opacity fade-in over the background.
+        filter_complex = (f"[1:v]scale={COMP_WIDTH}:-1,format=yuva420p,"
+                          f"fade=t=in:st=0:d={FADE_IN_DURATION}:alpha=1,"
+                          f"setpts=PTS-STARTPTS[media];"
+                          f"[0:v][media]overlay=(W-w)/2:{media_y_pos}:format=auto[bg_with_media];"
                           f"[bg_with_media][2:v]overlay=(W-w)/2:{caption_y_pos}[final_v]")
+
         map_args = ['-map', '[final_v]']
         if media_type == 'video':
             filter_complex += ";[1:a]asetpts=PTS-STARTPTS[final_a]"
