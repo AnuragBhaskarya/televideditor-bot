@@ -235,36 +235,23 @@ def isolated_video_processing_task(chat_id, media_path, media_type, caption_text
         scale_ratio = COMP_WIDTH / media_w
         scaled_media_h = int(media_h * scale_ratio)
         media_y_pos = (COMP_HEIGHT / 2 - scaled_media_h / 2) + MEDIA_Y_OFFSET
-        caption_y_pos = media_y_pos - caption_height + 1 # +1 to prevent pixel gap
+        caption_y_pos = media_y_pos - caption_height
 
         # 3. Build and run FFmpeg command
-        # --- MODIFIED: LOW MEMORY FADE ---
-        # We now use three inputs: the background color, the media, and the caption.
         command = ['ffmpeg', '-y', '-f', 'lavfi', '-i', f'color=c={BACKGROUND_COLOR}:s={COMP_SIZE_STR}:d={final_duration}']
         if media_type == 'image': command.extend(['-loop', '1', '-t', str(final_duration)])
         command.extend(['-i', media_path, '-i', caption_image_path])
-
-        # This filtergraph is different. It first builds the final scene without a fade,
-        # then uses the 'xfade' filter to dissolve from the plain black background (input 0)
-        # to the fully composed scene. This avoids creating a memory-hungry alpha channel.
-        filter_complex = (
-            f"[1:v]scale={COMP_WIDTH}:-1,setpts=PTS-STARTPTS[media];"
-            f"[0:v][media]overlay=(W-w)/2:{media_y_pos}[bg_with_media];"
-            f"[bg_with_media][2:v]overlay=(W-w)/2:{caption_y_pos}[comp];"
-            f"[0:v][comp]xfade=transition=fade:duration={FADE_IN_DURATION}:offset=0[final_v]"
-        )
-
+        filter_complex = (f"[1:v]scale={COMP_WIDTH}:-1,setpts=PTS-STARTPTS,fade=t=in:st=0:d={FADE_IN_DURATION}[media];"
+                          f"[0:v][media]overlay=(W-w)/2:{media_y_pos}[bg_with_media];"
+                          f"[bg_with_media][2:v]overlay=(W-w)/2:{caption_y_pos}[final_v]")
         map_args = ['-map', '[final_v]']
         if media_type == 'video':
             filter_complex += ";[1:a]asetpts=PTS-STARTPTS[final_a]"
             map_args.extend(['-map', '[final_a]'])
-        
-        # --- MODIFIED: CPU OPTIMIZATION ---
-        # On a single-core or low-power vCPU, forcing FFmpeg to use a single thread
-        # can sometimes be faster by avoiding thread management overhead.
         command.extend(['-filter_complex', filter_complex, *map_args])
-        command.extend(['-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1', '-c:a', 'aac', '-b:a', '192k', '-r', str(FPS), '-pix_fmt', 'yuv420p', output_filepath])
+        command.extend(['-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '2', '-c:a', 'aac', '-b:a', '192k', '-r', str(FPS), '-pix_fmt', 'yuv420p', output_filepath])
         
+        # Use PIPE to avoid large memory usage from capture_output=True
         subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         logging.info("FFmpeg processing finished.")
 
@@ -291,6 +278,7 @@ def isolated_video_processing_task(chat_id, media_path, media_type, caption_text
         # 5. Cleanup all temporary files
         files_to_clean = [media_path, caption_image_path, output_filepath, frame_path]
         cleanup_files(filter(None, files_to_clean))
+        # When this function ends, the entire process and all its memory are destroyed.
 
 # --- "Immortal" Main Bot Loop ---
 if __name__ == '__main__':
