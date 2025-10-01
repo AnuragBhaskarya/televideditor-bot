@@ -9,6 +9,8 @@ import json
 import logging
 import base64
 import re
+import multiprocessing
+import gc
 
 # --- Logging Configuration ---
 logging.basicConfig(
@@ -16,14 +18,12 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 
-
 # --- Constants and Configuration ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 WORKER_PUBLIC_URL = os.environ.get("WORKER_PUBLIC_URL")
 
 if not BOT_TOKEN or not WORKER_PUBLIC_URL:
     raise ValueError("BOT_TOKEN and WORKER_PUBLIC_URL environment variables must be set!")
-
 
 COMP_WIDTH = 1080
 COMP_HEIGHT = 1920
@@ -35,7 +35,7 @@ FADE_IN_DURATION = 6
 MEDIA_Y_OFFSET = 100
 CAPTION_V_PADDING = 37
 CAPTION_FONT_SIZE = 55
-CAPTION_TOP_PADDING_LINES = 0 # <--- NEW VARIABLE: Set this to 0, 1, 2, etc. for blank lines
+CAPTION_TOP_PADDING_LINES = 0
 CAPTION_LINE_SPACING = 12
 CAPTION_FONT = "Montserrat-ExtraBold"
 CAPTION_TEXT_COLOR = (0, 0, 0)
@@ -45,9 +45,12 @@ OUTPUT_PATH = "outputs"
 
 # --- Bot Initialization ---
 bot = telebot.TeleBot(BOT_TOKEN)
-user_data = {}
+# --- MODIFIED --- Using a multiprocessing-safe dictionary for user data
+manager = multiprocessing.Manager()
+user_data = manager.dict()
 
-# --- Helper Functions ---
+
+# --- Helper Functions (Mostly Unchanged) ---
 
 def cleanup_files(file_list):
     for file_path in file_list:
@@ -71,30 +74,21 @@ def get_media_dimensions(media_path, media_type):
         stream_data = data['streams'][0]
         return stream_data['width'], stream_data['height'], float(stream_data['duration'])
 
-# <--- MODIFIED FUNCTION ---
-def create_caption_image(text, media_width):
-    # Add the desired number of blank lines before the actual caption text
+def create_caption_image(text, media_width, chat_id):
     padded_text = ("\n" * CAPTION_TOP_PADDING_LINES) + text
-
     font_path = f"{CAPTION_FONT}.ttf"
     font = ImageFont.truetype(font_path, CAPTION_FONT_SIZE)
-    # Use the new padded_text for wrapping
     wrapped_lines = textwrap.wrap(padded_text, width=30, break_long_words=True)
     wrapped_text = "\n".join(wrapped_lines)
-    
-    # Pass the spacing parameter to multiline_textbbox
     text_bbox = ImageDraw.Draw(Image.new('RGB', (0,0))).multiline_textbbox(
         (0, 0), wrapped_text, font=font, align="center", spacing=CAPTION_LINE_SPACING
     )
-    
     text_height = text_bbox[3] - text_bbox[1]
     rect_height = text_height + (2 * CAPTION_V_PADDING)
     img_height = int(rect_height)
     img = Image.new('RGBA', (COMP_WIDTH, img_height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     draw.rectangle([(0, 0), (COMP_WIDTH, img_height)], fill=CAPTION_BG_COLOR)
-    
-    # Pass the spacing parameter to multiline_text
     draw.multiline_text(
         (COMP_WIDTH / 2, img_height / 2),
         wrapped_text,
@@ -104,11 +98,9 @@ def create_caption_image(text, media_width):
         align="center",
         spacing=CAPTION_LINE_SPACING
     )
-    
-    caption_image_path = os.path.join(OUTPUT_PATH, f"caption_{user_data.get('chat_id', 'temp')}.png")
+    caption_image_path = os.path.join(OUTPUT_PATH, f"caption_{chat_id}.png")
     img.save(caption_image_path)
     return caption_image_path, rect_height
-# <--- END OF MODIFIED FUNCTION ---
 
 def extract_frame_from_video(video_path, duration, chat_id):
     frame_path = os.path.join(OUTPUT_PATH, f"frame_{chat_id}.jpg")
@@ -122,27 +114,40 @@ def extract_frame_from_video(video_path, duration, chat_id):
         logging.error(f"FFmpeg frame extraction failed: {e.stderr}")
         return None
 
-
 # --- Telegram Handlers ---
+
 @bot.message_handler(content_types=['photo', 'video'])
 def handle_media(message):
     chat_id = message.chat.id
     if user_data.get(chat_id, {}).get('state') in ['downloading', 'processing']:
         bot.reply_to(message, "I'm currently busy. Please wait until the current process is finished.")
         return
+
     user_data[chat_id] = {'state': 'downloading'}
     download_message = bot.reply_to(message, "⬇️ Media detected. Starting download...")
+
     try:
         if message.content_type == 'photo': file_id, media_type = message.photo[-1].file_id, 'image'
         elif message.content_type == 'video': file_id, media_type = message.video.file_id, 'video'
-        user_data[chat_id]['media_type'] = media_type
+        
         file_info = bot.get_file(file_id)
-        downloaded_file = bot.download_file(file_info.file_path)
+        
+        # --- MODIFIED: STREAMING DOWNLOAD ---
+        # This downloads the file in small chunks directly to disk, preventing memory spikes.
+        file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_info.file_path}"
         file_extension = os.path.splitext(file_info.file_path)[1]
         save_path = os.path.join(DOWNLOAD_PATH, f"{chat_id}_{file_id}{file_extension}")
-        with open(save_path, 'wb') as new_file: new_file.write(downloaded_file)
-        user_data[chat_id].update({'media_path': save_path, 'state': 'awaiting_caption'})
+
+        with requests.get(file_url, stream=True) as r:
+            r.raise_for_status()
+            with open(save_path, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=8192): # Download in 8KB chunks
+                    f.write(chunk)
+        # --- END OF MODIFICATION ---
+
+        user_data[chat_id] = {'media_path': save_path, 'media_type': media_type, 'state': 'awaiting_caption'}
         bot.edit_message_text("✅ Media received! Now, please send the top caption text.", chat_id, download_message.message_id)
+
     except Exception as e:
         logging.error(f"Error in handle_media: {e}", exc_info=True)
         bot.edit_message_text(f"❌ An error occurred while processing your media.", chat_id, download_message.message_id)
@@ -152,31 +157,44 @@ def handle_media(message):
 def handle_text(message):
     chat_id = message.chat.id
     if user_data.get(chat_id, {}).get('state') == 'awaiting_caption':
-        user_data[chat_id].update({'state': 'processing', 'caption': message.text})
-        process_video_with_ffmpeg(chat_id)
-    else: bot.reply_to(message, "Please send an image or video first.")
+        session = user_data[chat_id]
+        
+        # --- MODIFIED: Hand off the heavy work to a separate process ---
+        processing_message = bot.send_message(chat_id, "⚙️ Your request is in the queue...")
+        
+        p = multiprocessing.Process(
+            target=isolated_video_processing_task,
+            args=(
+                chat_id,
+                session['media_path'],
+                session['media_type'],
+                message.text,
+                processing_message.message_id
+            )
+        )
+        p.start() # Start the background process
 
+        # Immediately clear the user data from the main process's memory
+        del user_data[chat_id]
+        
+    else:
+        bot.reply_to(message, "Please send an image or video first.")
+        # --- NEW --- Force garbage collection even after simple tasks
+        gc.collect()
 
-# --- NEW UPLOAD AND PROCESSING FUNCTION ---
+# --- NEW: UPLOAD FUNCTION (Unchanged but used by the new process) ---
 def upload_and_process(chat_id, video_path, frame_path):
-    """
-    Uploads the final video and the frame for AI captioning in a single request.
-    """
     worker_url = f"{WORKER_PUBLIC_URL}/process"
     try:
-        with open(frame_path, "rb") as image_file:
+        with open(frame_path, "rb") as image_file, open(video_path, 'rb') as video_file:
             image_data = base64.b64encode(image_file.read()).decode('utf-8')
-
-        with open(video_path, 'rb') as video_file:
             files = {
                 'video': ('final_video.mp4', video_file, 'video/mp4'),
                 'image_data': (None, image_data),
                 'chat_id': (None, str(chat_id))
             }
-            # The worker will respond quickly, but the full process runs in the background
             response = requests.post(worker_url, files=files, timeout=30)
             response.raise_for_status()
-            
         logging.info("Successfully sent video and frame to worker for processing.")
         return True
     except requests.exceptions.RequestException as e:
@@ -186,33 +204,40 @@ def upload_and_process(chat_id, video_path, frame_path):
         logging.error(f"An unexpected error occurred in upload_and_process: {e}")
         return False
 
+# --- NEW: ISOLATED PROCESSING FUNCTION ---
+# This function runs in a separate process to handle all memory-intensive tasks.
+def isolated_video_processing_task(chat_id, media_path, media_type, caption_text, message_id):
+    
+    # Helper to send messages from the background process
+    def send_bot_message(text, parse_mode=None):
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
+        payload = {'chat_id': chat_id, 'message_id': message_id, 'text': text}
+        if parse_mode:
+            payload['parse_mode'] = parse_mode
+        try:
+            requests.post(url, json=payload, timeout=10)
+        except Exception as e:
+            logging.error(f"Isolated process failed to send message: {e}")
 
-# --- Main Processing Function ---
-def process_video_with_ffmpeg(chat_id):
-    session = user_data.get(chat_id, {})
-    if not session or session.get('state') != 'processing':
-        bot.send_message(chat_id, "A critical error occurred. Session was lost.")
-        return
-
-    media_path = session.get('media_path')
     output_filepath = os.path.join(OUTPUT_PATH, f"output_{chat_id}.mp4")
     caption_image_path, frame_path = None, None
-    processing_message = bot.send_message(chat_id, "⚙️ Processing your video...")
 
     try:
-        # 1. FFmpeg Video Processing
-        logging.info(f"Starting video processing for chat {chat_id}")
-        media_type = session['media_type']
+        send_bot_message("⚙️ Processing your video...")
+        
+        # 1. Get media info
         final_duration = IMAGE_DURATION
         if media_type == 'image': media_w, media_h = get_media_dimensions(media_path, media_type)
         else: media_w, media_h, final_duration = get_media_dimensions(media_path, media_type)
 
-        caption_image_path, caption_height = create_caption_image(session['caption'], COMP_WIDTH)
+        # 2. Create caption image
+        caption_image_path, caption_height = create_caption_image(caption_text, COMP_WIDTH, chat_id)
         scale_ratio = COMP_WIDTH / media_w
         scaled_media_h = int(media_h * scale_ratio)
         media_y_pos = (COMP_HEIGHT / 2 - scaled_media_h / 2) + MEDIA_Y_OFFSET
         caption_y_pos = media_y_pos - caption_height
 
+        # 3. Build and run FFmpeg command
         command = ['ffmpeg', '-y', '-f', 'lavfi', '-i', f'color=c={BACKGROUND_COLOR}:s={COMP_SIZE_STR}:d={final_duration}']
         if media_type == 'image': command.extend(['-loop', '1', '-t', str(final_duration)])
         command.extend(['-i', media_path, '-i', caption_image_path])
@@ -225,37 +250,35 @@ def process_video_with_ffmpeg(chat_id):
             map_args.extend(['-map', '[final_a]'])
         command.extend(['-filter_complex', filter_complex, *map_args])
         command.extend(['-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '2', '-c:a', 'aac', '-b:a', '192k', '-r', str(FPS), '-pix_fmt', 'yuv420p', output_filepath])
-
-        subprocess.run(command, check=True, capture_output=True, text=True)
+        
+        # Use PIPE to avoid large memory usage from capture_output=True
+        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         logging.info("FFmpeg processing finished.")
 
-        # 2. Extract frame for AI
-        bot.edit_message_text("⬆️ Uploading and processing...", chat_id, processing_message.message_id)
+        # 4. Extract frame and upload
+        send_bot_message("⬆️ Uploading and processing...")
         frame_path = extract_frame_from_video(output_filepath, final_duration, chat_id)
-        
-        # 3. Upload everything to the worker
         if frame_path:
             if not upload_and_process(chat_id, output_filepath, frame_path):
-                bot.send_message(chat_id, "⚠️ Upload to our servers failed. Please try again.")
+                send_bot_message("⚠️ Upload to our servers failed. Please try again.")
         else:
             logging.error("Could not extract frame for AI analysis.")
-            bot.send_message(chat_id, "⚠️ Could not prepare video for AI analysis.")
+            send_bot_message("⚠️ Could not prepare video for AI analysis.")
 
-        # 4. Final Bot Message
-        bot.edit_message_text("✅ Done! GC will arrive shortly.", chat_id, processing_message.message_id)
+        send_bot_message("✅ Done! Your video and caption will arrive shortly.")
 
     except subprocess.CalledProcessError as e:
-        logging.error(f"FFmpeg failed for chat {chat_id}:\nSTDOUT: {e.stdout}\nSTDERR: {e.stderr}")
+        logging.error(f"FFmpeg failed for chat {chat_id}:\nSTDERR: {e.stderr}")
         error_details = f"FFmpeg Error:\n`{e.stderr[:1000]}`"
-        bot.edit_message_text(error_details, chat_id, processing_message.message_id, parse_mode="Markdown")
+        send_bot_message(error_details, parse_mode="Markdown")
     except Exception as e:
-        logging.error(f"Error in process_video_with_ffmpeg: {e}", exc_info=True)
-        bot.edit_message_text("An unexpected error occurred. Please try again.", chat_id, processing_message.message_id)
+        logging.error(f"Error in isolated process: {e}", exc_info=True)
+        send_bot_message("An unexpected error occurred. Please try again.")
     finally:
-        # 5. Cleanup Files
+        # 5. Cleanup all temporary files
         files_to_clean = [media_path, caption_image_path, output_filepath, frame_path]
         cleanup_files(filter(None, files_to_clean))
-        if chat_id in user_data: del user_data[chat_id]
+        # When this function ends, the entire process and all its memory are destroyed.
 
 # --- "Immortal" Main Bot Loop ---
 if __name__ == '__main__':
@@ -264,7 +287,7 @@ if __name__ == '__main__':
     while True:
         try:
             logging.info("Bot is alive and polling...")
-            bot.polling(none_stop=True, interval=0, timeout=20)
+            bot.polling(none_stop=True)
         except Exception as e:
             logging.error(f"Bot polling loop failed: {e}", exc_info=True)
             time.sleep(5)
