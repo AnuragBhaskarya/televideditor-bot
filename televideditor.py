@@ -235,7 +235,7 @@ def isolated_video_processing_task(chat_id, media_path, media_type, caption_text
         scale_ratio = COMP_WIDTH / media_w
         scaled_media_h = int(media_h * scale_ratio)
         media_y_pos = (COMP_HEIGHT / 2 - scaled_media_h / 2) + MEDIA_Y_OFFSET
-        caption_y_pos = media_y_pos - caption_height
+        caption_y_pos = media_y_pos - caption_height + 1
 
         # 3. Build and run FFmpeg command
         command = ['ffmpeg', '-y', '-f', 'lavfi', '-i', f'color=c={BACKGROUND_COLOR}:s={COMP_SIZE_STR}:d={final_duration}']
