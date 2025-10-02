@@ -78,8 +78,22 @@ def create_caption_image(text, media_width, chat_id):
     padded_text = ("\n" * CAPTION_TOP_PADDING_LINES) + text
     font_path = f"{CAPTION_FONT}.ttf"
     font = ImageFont.truetype(font_path, CAPTION_FONT_SIZE)
-    wrapped_lines = textwrap.wrap(padded_text, width=30, break_long_words=True)
-    wrapped_text = "\n".join(wrapped_lines)
+    
+    # --- MODIFICATION START ---
+    # Split the text by user-intended newlines first, then wrap each line.
+    final_lines = []
+    for line in padded_text.split('\n'):
+        # Wrap each individual line if it's too long
+        wrapped_line = textwrap.wrap(line, width=30, break_long_words=True)
+        # If a line was empty, textwrap returns an empty list. Preserve it as a single empty string.
+        if not wrapped_line:
+            final_lines.append('')
+        else:
+            final_lines.extend(wrapped_line)
+    
+    wrapped_text = "\n".join(final_lines)
+    # --- MODIFICATION END ---
+
     text_bbox = ImageDraw.Draw(Image.new('RGB', (0,0))).multiline_textbbox(
         (0, 0), wrapped_text, font=font, align="center", spacing=CAPTION_LINE_SPACING
     )
