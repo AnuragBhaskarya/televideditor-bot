@@ -273,8 +273,10 @@ def isolated_video_processing_task(chat_id, media_path, media_type, caption_text
         send_bot_message("⚙️ Processing your video...")
         
         final_duration = IMAGE_DURATION
-        if media_type == 'image': media_w, media_h = get_media_dimensions(media_path, media_type)
-        else: media_w, media_h, final_duration = get_media_dimensions(media_path, media_type)
+        if media_type == 'image':
+            media_w, media_h = get_media_dimensions(media_path, media_type)
+        else:
+            media_w, media_h, final_duration = get_media_dimensions(media_path, media_type)
 
         caption_image_path, caption_height = create_caption_image(caption_text, COMP_WIDTH, chat_id)
         scale_ratio = COMP_WIDTH / media_w
@@ -286,13 +288,29 @@ def isolated_video_processing_task(chat_id, media_path, media_type, caption_text
         if media_type == 'image': command.extend(['-loop', '1', '-t', str(final_duration)])
         command.extend(['-i', media_path, '-i', caption_image_path])
         
-        # --- MODIFICATION START: Conditional Fade-in Filter ---
+        # --- MODIFICATION START: Conditional Fade-in Filter using Black Overlay ---
         if apply_fade:
-            filter_complex = (f"[1:v]scale={COMP_WIDTH}:-1,setpts=PTS-STARTPTS,fade=t=in:st=0:d={FADE_IN_DURATION}[media];"
-                              f"[0:v][media]overlay=(W-w)/2:{media_y_pos}[bg_with_media];"
-                              f"[bg_with_media][2:v]overlay=(W-w)/2:{caption_y_pos}[final_v]")
+            filter_complex = (
+                # 1. Scale the media, same as before.
+                f"[1:v]scale={COMP_WIDTH}:-1,setpts=PTS-STARTPTS[scaled_media];"
+                
+                # 2. Create a black color source with the *exact* scaled media dimensions.
+                f"color=c=black:s={COMP_WIDTH}x{scaled_media_h+1}:d={final_duration}[black_layer];"
+                
+                # 3. THE CRUCIAL FIX: Give the black layer an alpha channel, THEN fade it out.
+                f"[black_layer]format=rgba,fade=t=out:st=0:d={FADE_IN_DURATION}[fading_black_layer];"
+                
+                # 4. Overlay the fading black layer on top of the scaled media.
+                f"[scaled_media][fading_black_layer]overlay=0:0[media_with_fade];"
+                
+                # 5. Overlay the result (media + fade effect) onto the main background.
+                f"[0:v][media_with_fade]overlay=(W-w)/2:{media_y_pos}[bg_with_media];"
+                
+                # 6. Overlay the caption on top of everything.
+                f"[bg_with_media][2:v]overlay=(W-w)/2:{caption_y_pos}[final_v]"
+            )
         else:
-            # Same filter chain, just without the 'fade' part
+            # This is the original logic for when there is no fade. It remains unchanged.
             filter_complex = (f"[1:v]scale={COMP_WIDTH}:-1,setpts=PTS-STARTPTS[media];"
                               f"[0:v][media]overlay=(W-w)/2:{media_y_pos}[bg_with_media];"
                               f"[bg_with_media][2:v]overlay=(W-w)/2:{caption_y_pos}[final_v]")
