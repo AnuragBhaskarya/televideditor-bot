@@ -11,6 +11,7 @@ import base64
 import re
 import multiprocessing
 import gc
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # --- Logging Configuration ---
 logging.basicConfig(
@@ -78,22 +79,8 @@ def create_caption_image(text, media_width, chat_id):
     padded_text = ("\n" * CAPTION_TOP_PADDING_LINES) + text
     font_path = f"{CAPTION_FONT}.ttf"
     font = ImageFont.truetype(font_path, CAPTION_FONT_SIZE)
-    
-    # --- MODIFICATION START ---
-    # Split the text by user-intended newlines first, then wrap each line.
-    final_lines = []
-    for line in padded_text.split('\n'):
-        # Wrap each individual line if it's too long
-        wrapped_line = textwrap.wrap(line, width=30, break_long_words=True)
-        # If a line was empty, textwrap returns an empty list. Preserve it as a single empty string.
-        if not wrapped_line:
-            final_lines.append('')
-        else:
-            final_lines.extend(wrapped_line)
-    
-    wrapped_text = "\n".join(final_lines)
-    # --- MODIFICATION END ---
-
+    wrapped_lines = textwrap.wrap(padded_text, width=30, break_long_words=True)
+    wrapped_text = "\n".join(wrapped_lines)
     text_bbox = ImageDraw.Draw(Image.new('RGB', (0,0))).multiline_textbbox(
         (0, 0), wrapped_text, font=font, align="center", spacing=CAPTION_LINE_SPACING
     )
@@ -133,7 +120,7 @@ def extract_frame_from_video(video_path, duration, chat_id):
 @bot.message_handler(content_types=['photo', 'video'])
 def handle_media(message):
     chat_id = message.chat.id
-    if user_data.get(chat_id, {}).get('state') in ['downloading', 'processing']:
+    if user_data.get(chat_id, {}).get('state') in ['downloading', 'processing', 'awaiting_fade_choice']:
         bot.reply_to(message, "I'm currently busy. Please wait until the current process is finished.")
         return
 
@@ -146,8 +133,6 @@ def handle_media(message):
         
         file_info = bot.get_file(file_id)
         
-        # --- MODIFIED: STREAMING DOWNLOAD ---
-        # This downloads the file in small chunks directly to disk, preventing memory spikes.
         file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_info.file_path}"
         file_extension = os.path.splitext(file_info.file_path)[1]
         save_path = os.path.join(DOWNLOAD_PATH, f"{chat_id}_{file_id}{file_extension}")
@@ -155,9 +140,8 @@ def handle_media(message):
         with requests.get(file_url, stream=True) as r:
             r.raise_for_status()
             with open(save_path, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=8192): # Download in 8KB chunks
+                for chunk in r.iter_content(chunk_size=8192):
                     f.write(chunk)
-        # --- END OF MODIFICATION ---
 
         user_data[chat_id] = {'media_path': save_path, 'media_type': media_type, 'state': 'awaiting_caption'}
         bot.edit_message_text("✅ Media received! Now, please send the top caption text.", chat_id, download_message.message_id)
@@ -167,36 +151,57 @@ def handle_media(message):
         bot.edit_message_text(f"❌ An error occurred while processing your media.", chat_id, download_message.message_id)
         if chat_id in user_data: del user_data[chat_id]
 
-@bot.message_handler(func=lambda message: True)
+@bot.message_handler(func=lambda message: user_data.get(message.chat.id, {}).get('state') == 'awaiting_caption')
 def handle_text(message):
     chat_id = message.chat.id
-    if user_data.get(chat_id, {}).get('state') == 'awaiting_caption':
-        session = user_data[chat_id]
-        
-        # --- MODIFIED: Hand off the heavy work to a separate process ---
-        processing_message = bot.send_message(chat_id, "⚙️ Your request is in the queue...")
-        
-        p = multiprocessing.Process(
-            target=isolated_video_processing_task,
-            args=(
-                chat_id,
-                session['media_path'],
-                session['media_type'],
-                message.text,
-                processing_message.message_id
-            )
+    # --- NEW: Store caption and change state ---
+    session = user_data[chat_id]
+    session['caption'] = message.text
+    session['state'] = 'awaiting_fade_choice'
+    user_data[chat_id] = session # Important to re-assign for the manager.dict
+
+    # --- NEW: Ask user about fade-in effect with inline buttons ---
+    markup = InlineKeyboardMarkup()
+    markup.row_width = 2
+    markup.add(InlineKeyboardButton("Yes", callback_data="fade_yes"),
+               InlineKeyboardButton("No", callback_data="fade_no"))
+    bot.reply_to(message, "Want fade-in effect?", reply_markup=markup)
+
+# --- NEW: Callback handler for the fade-in choice ---
+@bot.callback_query_handler(func=lambda call: user_data.get(call.message.chat.id, {}).get('state') == 'awaiting_fade_choice')
+def handle_fade_choice(call):
+    chat_id = call.message.chat.id
+    session = user_data[chat_id]
+    apply_fade = call.data == "fade_yes"
+
+    # Edit the message to give feedback and prevent re-clicks
+    bot.edit_message_text("Got it!", chat_id, call.message.message_id)
+    
+    # --- Hand off the heavy work to a separate process ---
+    processing_message = bot.send_message(chat_id, "⚙️ Your request is in the queue...")
+    
+    p = multiprocessing.Process(
+        target=isolated_video_processing_task,
+        args=(
+            chat_id,
+            session['media_path'],
+            session['media_type'],
+            session['caption'],
+            processing_message.message_id,
+            apply_fade # Pass the user's choice to the processing function
         )
-        p.start() # Start the background process
+    )
+    p.start() # Start the background process
 
-        # Immediately clear the user data from the main process's memory
-        del user_data[chat_id]
-        
-    else:
-        bot.reply_to(message, "Please send an image or video first.")
-        # --- NEW --- Force garbage collection even after simple tasks
-        gc.collect()
+    # Immediately clear the user data from the main process's memory
+    del user_data[chat_id]
 
-# --- NEW: UPLOAD FUNCTION (Unchanged but used by the new process) ---
+@bot.message_handler(func=lambda message: True)
+def handle_other_messages(message):
+    bot.reply_to(message, "Please send an image or video first.")
+    gc.collect()
+
+# --- UPLOAD FUNCTION (Unchanged) ---
 def upload_and_process(chat_id, video_path, frame_path):
     worker_url = f"{WORKER_PUBLIC_URL}/process"
     try:
@@ -218,11 +223,10 @@ def upload_and_process(chat_id, video_path, frame_path):
         logging.error(f"An unexpected error occurred in upload_and_process: {e}")
         return False
 
-# --- NEW: ISOLATED PROCESSING FUNCTION ---
-# This function runs in a separate process to handle all memory-intensive tasks.
-def isolated_video_processing_task(chat_id, media_path, media_type, caption_text, message_id):
+# --- MODIFIED: ISOLATED PROCESSING FUNCTION ---
+# This function now accepts an `apply_fade` boolean to control the effect.
+def isolated_video_processing_task(chat_id, media_path, media_type, caption_text, message_id, apply_fade):
     
-    # Helper to send messages from the background process
     def send_bot_message(text, parse_mode=None):
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
         payload = {'chat_id': chat_id, 'message_id': message_id, 'text': text}
@@ -239,37 +243,42 @@ def isolated_video_processing_task(chat_id, media_path, media_type, caption_text
     try:
         send_bot_message("⚙️ Processing your video...")
         
-        # 1. Get media info
         final_duration = IMAGE_DURATION
         if media_type == 'image': media_w, media_h = get_media_dimensions(media_path, media_type)
         else: media_w, media_h, final_duration = get_media_dimensions(media_path, media_type)
 
-        # 2. Create caption image
         caption_image_path, caption_height = create_caption_image(caption_text, COMP_WIDTH, chat_id)
         scale_ratio = COMP_WIDTH / media_w
         scaled_media_h = int(media_h * scale_ratio)
         media_y_pos = (COMP_HEIGHT / 2 - scaled_media_h / 2) + MEDIA_Y_OFFSET
         caption_y_pos = media_y_pos - caption_height + 1
 
-        # 3. Build and run FFmpeg command
         command = ['ffmpeg', '-y', '-f', 'lavfi', '-i', f'color=c={BACKGROUND_COLOR}:s={COMP_SIZE_STR}:d={final_duration}']
         if media_type == 'image': command.extend(['-loop', '1', '-t', str(final_duration)])
         command.extend(['-i', media_path, '-i', caption_image_path])
-        filter_complex = (f"[1:v]scale={COMP_WIDTH}:-1,setpts=PTS-STARTPTS,fade=t=in:st=0:d={FADE_IN_DURATION}[media];"
-                          f"[0:v][media]overlay=(W-w)/2:{media_y_pos}[bg_with_media];"
-                          f"[bg_with_media][2:v]overlay=(W-w)/2:{caption_y_pos}[final_v]")
+
+        # --- NEW: Conditionally add the fade-in effect ---
+        if apply_fade:
+            filter_complex = (f"[1:v]scale={COMP_WIDTH}:-1,setpts=PTS-STARTPTS,fade=t=in:st=0:d={FADE_IN_DURATION}[media];"
+                              f"[0:v][media]overlay=(W-w)/2:{media_y_pos}[bg_with_media];"
+                              f"[bg_with_media][2:v]overlay=(W-w)/2:{caption_y_pos}[final_v]")
+        else:
+            # Same filter complex but without the 'fade' part
+            filter_complex = (f"[1:v]scale={COMP_WIDTH}:-1,setpts=PTS-STARTPTS[media];"
+                              f"[0:v][media]overlay=(W-w)/2:{media_y_pos}[bg_with_media];"
+                              f"[bg_with_media][2:v]overlay=(W-w)/2:{caption_y_pos}[final_v]")
+
         map_args = ['-map', '[final_v]']
         if media_type == 'video':
             filter_complex += ";[1:a]asetpts=PTS-STARTPTS[final_a]"
             map_args.extend(['-map', '[final_a]'])
+            
         command.extend(['-filter_complex', filter_complex, *map_args])
         command.extend(['-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '2', '-c:a', 'aac', '-b:a', '192k', '-r', str(FPS), '-pix_fmt', 'yuv420p', output_filepath])
         
-        # Use PIPE to avoid large memory usage from capture_output=True
         subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         logging.info("FFmpeg processing finished.")
 
-        # 4. Extract frame and upload
         send_bot_message("⬆️ Uploading and processing...")
         frame_path = extract_frame_from_video(output_filepath, final_duration, chat_id)
         if frame_path:
@@ -289,10 +298,8 @@ def isolated_video_processing_task(chat_id, media_path, media_type, caption_text
         logging.error(f"Error in isolated process: {e}", exc_info=True)
         send_bot_message("An unexpected error occurred. Please try again.")
     finally:
-        # 5. Cleanup all temporary files
         files_to_clean = [media_path, caption_image_path, output_filepath, frame_path]
         cleanup_files(filter(None, files_to_clean))
-        # When this function ends, the entire process and all its memory are destroyed.
 
 # --- "Immortal" Main Bot Loop ---
 if __name__ == '__main__':
