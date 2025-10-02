@@ -21,8 +21,8 @@ logging.basicConfig(
 )
 
 # --- Constants and Configuration ---
-WORKER_PUBLIC_URL = "https://video-editor.kmxconnect.workers.dev"
-BOT_TOKEN = "6681721565:AAGo1PkeAYlaZIgu3HNFFF9IBSuwPXfUOk0"
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+WORKER_PUBLIC_URL = os.environ.get("WORKER_PUBLIC_URL")
 
 if not BOT_TOKEN or not WORKER_PUBLIC_URL:
     raise ValueError("BOT_TOKEN and WORKER_PUBLIC_URL environment variables must be set!")
