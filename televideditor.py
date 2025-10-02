@@ -1,5 +1,6 @@
 import os
 import telebot
+from telebot import types # <-- IMPORTED FOR INLINE BUTTONS
 import time
 import requests
 from PIL import Image, ImageDraw, ImageFont
@@ -11,7 +12,6 @@ import base64
 import re
 import multiprocessing
 import gc
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # --- Logging Configuration ---
 logging.basicConfig(
@@ -46,7 +46,7 @@ OUTPUT_PATH = "outputs"
 
 # --- Bot Initialization ---
 bot = telebot.TeleBot(BOT_TOKEN)
-# --- MODIFIED --- Using a multiprocessing-safe dictionary for user data
+# --- Using a multiprocessing-safe dictionary for user data
 manager = multiprocessing.Manager()
 user_data = manager.dict()
 
@@ -79,8 +79,17 @@ def create_caption_image(text, media_width, chat_id):
     padded_text = ("\n" * CAPTION_TOP_PADDING_LINES) + text
     font_path = f"{CAPTION_FONT}.ttf"
     font = ImageFont.truetype(font_path, CAPTION_FONT_SIZE)
-    wrapped_lines = textwrap.wrap(padded_text, width=30, break_long_words=True)
-    wrapped_text = "\n".join(wrapped_lines)
+    
+    final_lines = []
+    for line in padded_text.split('\n'):
+        wrapped_line = textwrap.wrap(line, width=30, break_long_words=True)
+        if not wrapped_line:
+            final_lines.append('')
+        else:
+            final_lines.extend(wrapped_line)
+    
+    wrapped_text = "\n".join(final_lines)
+
     text_bbox = ImageDraw.Draw(Image.new('RGB', (0,0))).multiline_textbbox(
         (0, 0), wrapped_text, font=font, align="center", spacing=CAPTION_LINE_SPACING
     )
@@ -120,7 +129,7 @@ def extract_frame_from_video(video_path, duration, chat_id):
 @bot.message_handler(content_types=['photo', 'video'])
 def handle_media(message):
     chat_id = message.chat.id
-    if user_data.get(chat_id, {}).get('state') in ['downloading', 'processing', 'awaiting_fade_choice']:
+    if user_data.get(chat_id, {}).get('state') in ['downloading', 'processing']:
         bot.reply_to(message, "I'm currently busy. Please wait until the current process is finished.")
         return
 
@@ -143,7 +152,14 @@ def handle_media(message):
                 for chunk in r.iter_content(chunk_size=8192):
                     f.write(chunk)
 
-        user_data[chat_id] = {'media_path': save_path, 'media_type': media_type, 'state': 'awaiting_caption'}
+        # --- MODIFICATION --- Update state and store media info
+        current_data = user_data.get(chat_id, {})
+        current_data.update({
+            'media_path': save_path,
+            'media_type': media_type,
+            'state': 'awaiting_caption'
+        })
+        user_data[chat_id] = current_data
         bot.edit_message_text("✅ Media received! Now, please send the top caption text.", chat_id, download_message.message_id)
 
     except Exception as e:
@@ -154,44 +170,56 @@ def handle_media(message):
 @bot.message_handler(func=lambda message: user_data.get(message.chat.id, {}).get('state') == 'awaiting_caption')
 def handle_text(message):
     chat_id = message.chat.id
-    # --- NEW: Store caption and change state ---
+    # --- MODIFICATION START ---
+    # Store caption and ask about the fade effect
     session = user_data[chat_id]
-    session['caption'] = message.text
+    session['caption_text'] = message.text
     session['state'] = 'awaiting_fade_choice'
-    user_data[chat_id] = session # Important to re-assign for the manager.dict
+    user_data[chat_id] = session
 
-    # --- NEW: Ask user about fade-in effect with inline buttons ---
-    markup = InlineKeyboardMarkup()
-    markup.row_width = 2
-    markup.add(InlineKeyboardButton("Yes", callback_data="fade_yes"),
-               InlineKeyboardButton("No", callback_data="fade_no"))
-    bot.reply_to(message, "Want fade-in effect?", reply_markup=markup)
+    markup = types.InlineKeyboardMarkup()
+    yes_button = types.InlineKeyboardButton("Yes", callback_data="fade_yes")
+    no_button = types.InlineKeyboardButton("No", callback_data="fade_no")
+    markup.add(yes_button, no_button)
+    
+    bot.send_message(chat_id, "Want fade-in effect?", reply_markup=markup)
+    # --- MODIFICATION END ---
 
-# --- NEW: Callback handler for the fade-in choice ---
-@bot.callback_query_handler(func=lambda call: user_data.get(call.message.chat.id, {}).get('state') == 'awaiting_fade_choice')
+# --- NEW: CALLBACK HANDLER FOR FADE-IN CHOICE ---
+@bot.callback_query_handler(func=lambda call: call.data.startswith('fade_'))
 def handle_fade_choice(call):
     chat_id = call.message.chat.id
-    session = user_data[chat_id]
-    apply_fade = call.data == "fade_yes"
+    if user_data.get(chat_id, {}).get('state') != 'awaiting_fade_choice':
+        bot.answer_callback_query(call.id, "This choice is no longer valid.", show_alert=True)
+        return
 
-    # Edit the message to give feedback and prevent re-clicks
-    bot.edit_message_text("Got it!", chat_id, call.message.message_id)
+    # Acknowledge the button press
+    bot.answer_callback_query(call.id)
     
-    # --- Hand off the heavy work to a separate process ---
+    # Determine user's choice
+    apply_fade = call.data == "fade_yes"
+    
+    session = user_data[chat_id]
+    
+    # Edit the original message to remove the buttons and show the choice
+    choice_text = "Yes" if apply_fade else "No"
+    bot.edit_message_text(f"Fade-in effect: {choice_text}", chat_id, call.message.message_id)
+    
     processing_message = bot.send_message(chat_id, "⚙️ Your request is in the queue...")
     
+    # Start the background process with the fade choice
     p = multiprocessing.Process(
         target=isolated_video_processing_task,
         args=(
             chat_id,
             session['media_path'],
             session['media_type'],
-            session['caption'],
-            processing_message.message_id,
-            apply_fade # Pass the user's choice to the processing function
+            session['caption_text'],
+            apply_fade, # <-- Pass the new argument
+            processing_message.message_id
         )
     )
-    p.start() # Start the background process
+    p.start()
 
     # Immediately clear the user data from the main process's memory
     del user_data[chat_id]
@@ -200,6 +228,7 @@ def handle_fade_choice(call):
 def handle_other_messages(message):
     bot.reply_to(message, "Please send an image or video first.")
     gc.collect()
+
 
 # --- UPLOAD FUNCTION (Unchanged) ---
 def upload_and_process(chat_id, video_path, frame_path):
@@ -224,8 +253,8 @@ def upload_and_process(chat_id, video_path, frame_path):
         return False
 
 # --- MODIFIED: ISOLATED PROCESSING FUNCTION ---
-# This function now accepts an `apply_fade` boolean to control the effect.
-def isolated_video_processing_task(chat_id, media_path, media_type, caption_text, message_id, apply_fade):
+# This function now accepts 'apply_fade' to conditionally build the FFmpeg command.
+def isolated_video_processing_task(chat_id, media_path, media_type, caption_text, apply_fade, message_id):
     
     def send_bot_message(text, parse_mode=None):
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
@@ -256,23 +285,23 @@ def isolated_video_processing_task(chat_id, media_path, media_type, caption_text
         command = ['ffmpeg', '-y', '-f', 'lavfi', '-i', f'color=c={BACKGROUND_COLOR}:s={COMP_SIZE_STR}:d={final_duration}']
         if media_type == 'image': command.extend(['-loop', '1', '-t', str(final_duration)])
         command.extend(['-i', media_path, '-i', caption_image_path])
-
-        # --- NEW: Conditionally add the fade-in effect ---
+        
+        # --- MODIFICATION START: Conditional Fade-in Filter ---
         if apply_fade:
             filter_complex = (f"[1:v]scale={COMP_WIDTH}:-1,setpts=PTS-STARTPTS,fade=t=in:st=0:d={FADE_IN_DURATION}[media];"
                               f"[0:v][media]overlay=(W-w)/2:{media_y_pos}[bg_with_media];"
                               f"[bg_with_media][2:v]overlay=(W-w)/2:{caption_y_pos}[final_v]")
         else:
-            # Same filter complex but without the 'fade' part
+            # Same filter chain, just without the 'fade' part
             filter_complex = (f"[1:v]scale={COMP_WIDTH}:-1,setpts=PTS-STARTPTS[media];"
                               f"[0:v][media]overlay=(W-w)/2:{media_y_pos}[bg_with_media];"
                               f"[bg_with_media][2:v]overlay=(W-w)/2:{caption_y_pos}[final_v]")
-
+        # --- MODIFICATION END ---
+        
         map_args = ['-map', '[final_v]']
         if media_type == 'video':
             filter_complex += ";[1:a]asetpts=PTS-STARTPTS[final_a]"
             map_args.extend(['-map', '[final_a]'])
-            
         command.extend(['-filter_complex', filter_complex, *map_args])
         command.extend(['-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '2', '-c:a', 'aac', '-b:a', '192k', '-r', str(FPS), '-pix_fmt', 'yuv420p', output_filepath])
         
