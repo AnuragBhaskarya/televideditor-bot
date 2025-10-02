@@ -23,9 +23,11 @@ logging.basicConfig(
 # --- Constants and Configuration ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 WORKER_PUBLIC_URL = os.environ.get("WORKER_PUBLIC_URL")
+RAILWAY_API_TOKEN = os.environ.get("RAILWAY_API_TOKEN") # <-- Add this
+RAILWAY_SERVICE_ID = os.environ.get("RAILWAY_SERVICE_ID") # <-- Add this
 
-if not BOT_TOKEN or not WORKER_PUBLIC_URL:
-    raise ValueError("BOT_TOKEN and WORKER_PUBLIC_URL environment variables must be set!")
+if not all([BOT_TOKEN, WORKER_PUBLIC_URL, RAILWAY_API_TOKEN, RAILWAY_SERVICE_ID]):
+    raise ValueError("BOT_TOKEN, WORKER_PUBLIC_URL, RAILWAY_API_TOKEN, and RAILWAY_SERVICE_ID environment variables must be set!")
 
 # --- Video Processing Constants ---
 COMP_WIDTH = 1080
@@ -70,6 +72,76 @@ def create_directories():
     for path in [DOWNLOAD_PATH, OUTPUT_PATH]:
         if not os.path.exists(path):
             os.makedirs(path)
+            
+# --- restart itself ---
+
+def restart_railway_deployment():
+    """
+    Restarts the Railway deployment by fetching the latest deployment ID
+    and using the Railway GraphQL API to trigger a restart.
+    """
+    logging.info("Attempting to restart Railway deployment...")
+    api_token = os.environ.get("RAILWAY_API_TOKEN")
+    service_id = os.environ.get("RAILWAY_SERVICE_ID")
+
+    if not api_token or not service_id:
+        logging.warning("RAILWAY_API_TOKEN or RAILWAY_SERVICE_ID is not set. Skipping restart.")
+        return
+
+    graphql_url = "https://backboard.railway.app/graphql/v2"
+    headers = {
+        "Authorization": f"Bearer {api_token}",
+        "Content-Type": "application/json"
+    }
+
+    # Step 1: Get the latest deployment ID
+    get_id_query = {
+        "query": """
+            query getLatestDeployment($serviceId: String!) {
+                service(id: $serviceId) {
+                    deployments(first: 1) {
+                        edges {
+                            node { id }
+                        }
+                    }
+                }
+            }
+        """,
+        "variables": {"serviceId": service_id}
+    }
+
+    try:
+        response = requests.post(graphql_url, json=get_id_query, headers=headers, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+        
+        deployment_id = data['data']['service']['deployments']['edges'][0]['node']['id']
+        logging.info(f"Successfully fetched latest deployment ID: {deployment_id}")
+
+    except (requests.exceptions.RequestException, KeyError, IndexError) as e:
+        logging.error(f"Failed to get Railway deployment ID: {e}")
+        logging.error(f"Response from Railway: {response.text if 'response' in locals() else 'No response'}")
+        return # Stop if we can't get the ID
+
+    # Step 2: Trigger the restart using the deployment ID
+    restart_mutation = {
+        "query": """
+            mutation deploymentRestart($id: String!) {
+                deploymentRestart(id: $id)
+            }
+        """,
+        "variables": {"id": deployment_id}
+    }
+
+    try:
+        response = requests.post(graphql_url, json=restart_mutation, headers=headers, timeout=15)
+        response.raise_for_status()
+        logging.info("Successfully sent restart command to Railway.")
+
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Failed to send restart command to Railway: {e}")
+        logging.error(f"Response from Railway: {response.text if 'response' in locals() else 'No response'}")
+        
 
 def get_media_dimensions(media_path, media_type):
     """Get dimensions and duration of media using ffprobe or PIL."""
@@ -388,6 +460,7 @@ def isolated_video_processing_task(chat_id, media_path, media_type, caption_text
         send_bot_message("An unexpected server error occurred. Please try again.")
     finally:
         cleanup_files(files_to_clean)
+        restart_railway_deployment() # <--- RESTART BOT
 
 # --- Main Bot Loop ---
 if __name__ == '__main__':
