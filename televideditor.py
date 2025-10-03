@@ -65,40 +65,73 @@ def create_directories():
 # --- Railway API Functions ---
 
 def stop_railway_deployment():
-    """Stops the Railway deployment by setting its replica count to 0."""
+    """
+    Stops the Railway deployment by fetching the latest deployment ID
+    and using the Railway GraphQL API to trigger a stop on that specific deployment.
+    """
     logging.info("Attempting to stop Railway deployment...")
+    api_token = os.environ.get("RAILWAY_API_TOKEN")
+    service_id = os.environ.get("RAILWAY_SERVICE_ID")
+
+    if not api_token or not service_id:
+        logging.warning("RAILWAY_API_TOKEN or RAILWAY_SERVICE_ID is not set. Skipping stop command.")
+        return
+
     graphql_url = "https://backboard.railway.app/graphql/v2"
     headers = {
-        "Authorization": f"Bearer {RAILWAY_API_TOKEN}",
+        "Authorization": f"Bearer {api_token}",
         "Content-Type": "application/json"
     }
 
-    # This mutation sets the number of running instances (replicas) to 0.
-    stop_mutation = {
+    # Step 1: Get the latest deployment ID (This is identical to the restart logic)
+    get_id_query = {
         "query": """
-            mutation serviceUpdate($id: String!, $input: ServiceUpdateInput!) {
-                serviceUpdate(id: $id, input: $input) {
-                    id
+            query getLatestDeployment($serviceId: String!) {
+                service(id: $serviceId) {
+                    deployments(first: 1) {
+                        edges {
+                            node { id }
+                        }
+                    }
                 }
             }
         """,
-        "variables": {
-            "id": RAILWAY_SERVICE_ID,
-            "input": {
-                "replicaCount": 0
-            }
-        }
+        "variables": {"serviceId": service_id}
     }
 
     try:
-        response = requests.post(graphql_url, json=stop_mutation, headers=headers, timeout=20)
+        response = requests.post(graphql_url, json=get_id_query, headers=headers, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+        
+        deployment_id = data['data']['service']['deployments']['edges'][0]['node']['id']
+        logging.info(f"Successfully fetched latest deployment ID for shutdown: {deployment_id}")
+
+    except (requests.exceptions.RequestException, KeyError, IndexError) as e:
+        logging.error(f"Failed to get Railway deployment ID for shutdown: {e}")
+        if 'response' in locals():
+            logging.error(f"Response from Railway: {response.text}")
+        return # Stop if we can't get the ID
+
+    # Step 2: Trigger the stop using the fetched deployment ID
+    stop_mutation = {
+        "query": """
+            mutation deploymentStop($id: String!) {
+                deploymentStop(id: $id)
+            }
+        """,
+        "variables": {"id": deployment_id}
+    }
+
+    try:
+        response = requests.post(graphql_url, json=stop_mutation, headers=headers, timeout=15)
         response.raise_for_status()
         logging.info("Successfully sent stop command to Railway. Service will shut down.")
+
     except requests.exceptions.RequestException as e:
         logging.error(f"Failed to send stop command to Railway: {e}")
         if 'response' in locals():
             logging.error(f"Response from Railway: {response.text}")
-
 # --- Worker Communication Functions ---
 
 def fetch_job_from_worker():
