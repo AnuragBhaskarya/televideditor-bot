@@ -1,5 +1,4 @@
 import os
-import sys
 import telebot
 from telebot import types
 import time
@@ -10,8 +9,9 @@ import subprocess
 import json
 import logging
 import base64
+import re
 import multiprocessing
-import threading
+import threading # <-- Using threading for lightweight background tasks
 from threading import Lock
 
 # --- Logging Configuration ---
@@ -23,11 +23,11 @@ logging.basicConfig(
 # --- Constants and Configuration ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 WORKER_PUBLIC_URL = os.environ.get("WORKER_PUBLIC_URL")
-RAILWAY_API_TOKEN = os.environ.get("RAILWAY_API_TOKEN")
-RAILWAY_SERVICE_ID = os.environ.get("RAILWAY_SERVICE_ID")
+RAILWAY_API_TOKEN = os.environ.get("RAILWAY_API_TOKEN") # <-- Add this
+RAILWAY_SERVICE_ID = os.environ.get("RAILWAY_SERVICE_ID") # <-- Add this
 
 if not all([BOT_TOKEN, WORKER_PUBLIC_URL, RAILWAY_API_TOKEN, RAILWAY_SERVICE_ID]):
-    raise ValueError("One or more critical environment variables are not set!")
+    raise ValueError("BOT_TOKEN, WORKER_PUBLIC_URL, RAILWAY_API_TOKEN, and RAILWAY_SERVICE_ID environment variables must be set!")
 
 # --- Video Processing Constants ---
 COMP_WIDTH = 1080
@@ -46,12 +46,12 @@ CAPTION_FONT = "Montserrat-ExtraBold"
 CAPTION_TEXT_COLOR = (0, 0, 0)
 CAPTION_BG_COLOR = (255, 255, 255)
 
-# --- File Paths ---
+# --- File Paths and Session Management ---
 DOWNLOAD_PATH = "downloads"
 OUTPUT_PATH = "outputs"
+SESSION_TIMEOUT = 1800  # 30 minutes in seconds
 
-# --- Bot Initialization ---
-# The bot object is still needed to interact with the Telegram API (send/download)
+# --- Bot Initialization and Thread-Safe Session Management ---
 bot = telebot.TeleBot(BOT_TOKEN)
 user_data = {}
 user_data_lock = Lock()
@@ -73,52 +73,74 @@ def create_directories():
         if not os.path.exists(path):
             os.makedirs(path)
             
-# --- stop itself ---
+# --- restart itself ---
 
-def stop_railway_deployment():
+def restart_railway_deployment():
     """
-    MODIFIED: Notifies the worker to reset its state, then stops the Railway deployment.
+    Restarts the Railway deployment by fetching the latest deployment ID
+    and using the Railway GraphQL API to trigger a restart.
     """
-    # Step 1: Tell the worker it can start listening for messages again.
-    reset_url = f"{WORKER_PUBLIC_URL}/reset"
-    logging.info(f"Sending GET request to worker reset endpoint: {reset_url}")
-    try:
-        response = requests.get(reset_url, timeout=10)
-        if response.status_code == 200:
-            logging.info("Successfully notified worker to reset.")
-        else:
-            logging.warning(f"Worker reset endpoint returned status {response.status_code}: {response.text}")
-    except requests.exceptions.RequestException as e:
-        # Log the error but continue, as stopping the deployment is critical.
-        logging.error(f"Failed to send reset signal to worker: {e}")
+    logging.info("Attempting to restart Railway deployment...")
+    api_token = os.environ.get("RAILWAY_API_TOKEN")
+    service_id = os.environ.get("RAILWAY_SERVICE_ID")
 
-    # Step 2: Proceed with stopping the Railway deployment.
-    logging.info("Attempting to stop Railway deployment...")
-    api_token = RAILWAY_API_TOKEN
-    service_id = RAILWAY_SERVICE_ID
+    if not api_token or not service_id:
+        logging.warning("RAILWAY_API_TOKEN or RAILWAY_SERVICE_ID is not set. Skipping restart.")
+        return
+
     graphql_url = "https://backboard.railway.app/graphql/v2"
-    headers = {"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {api_token}",
+        "Content-Type": "application/json"
+    }
 
+    # Step 1: Get the latest deployment ID
     get_id_query = {
-        "query": "query getLatestDeployment($serviceId: String!) { service(id: $serviceId) { deployments(first: 1) { edges { node { id } } } } }",
+        "query": """
+            query getLatestDeployment($serviceId: String!) {
+                service(id: $serviceId) {
+                    deployments(first: 1) {
+                        edges {
+                            node { id }
+                        }
+                    }
+                }
+            }
+        """,
         "variables": {"serviceId": service_id}
     }
 
     try:
         response = requests.post(graphql_url, json=get_id_query, headers=headers, timeout=15)
         response.raise_for_status()
-        deployment_id = response.json()['data']['service']['deployments']['edges'][0]['node']['id']
-        logging.info(f"Fetched latest deployment ID: {deployment_id}")
+        data = response.json()
+        
+        deployment_id = data['data']['service']['deployments']['edges'][0]['node']['id']
+        logging.info(f"Successfully fetched latest deployment ID: {deployment_id}")
 
-        stop_mutation = {
-            "query": "mutation deploymentStop($id: String!) { deploymentStop(id: $id) }",
-            "variables": {"id": deployment_id}
-        }
-        response = requests.post(graphql_url, json=stop_mutation, headers=headers, timeout=15)
-        response.raise_for_status()
-        logging.info("Successfully sent stop command to Railway.")
     except (requests.exceptions.RequestException, KeyError, IndexError) as e:
-        logging.error(f"Failed to stop Railway deployment: {e}")
+        logging.error(f"Failed to get Railway deployment ID: {e}")
+        logging.error(f"Response from Railway: {response.text if 'response' in locals() else 'No response'}")
+        return # Stop if we can't get the ID
+
+    # Step 2: Trigger the restart using the deployment ID
+    restart_mutation = {
+        "query": """
+            mutation deploymentRestart($id: String!) {
+                deploymentRestart(id: $id)
+            }
+        """,
+        "variables": {"id": deployment_id}
+    }
+
+    try:
+        response = requests.post(graphql_url, json=restart_mutation, headers=headers, timeout=15)
+        response.raise_for_status()
+        logging.info("Successfully sent restart command to Railway.")
+
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Failed to send restart command to Railway: {e}")
+        logging.error(f"Response from Railway: {response.text if 'response' in locals() else 'No response'}")
         
 
 def get_media_dimensions(media_path, media_type):
@@ -189,90 +211,6 @@ def extract_frame_from_video(video_path, duration, chat_id):
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         logging.error(f"FFmpeg frame extraction failed: {getattr(e, 'stderr', e)}")
         return None
-        
-def get_job_from_worker():
-    """Fetches a single job from the Cloudflare worker's queue."""
-    job_url = f"{WORKER_PUBLIC_URL}/get-job"
-    try:
-        logging.info(f"Requesting job from worker: {job_url}")
-        response = requests.get(job_url, timeout=20)
-        if response.status_code == 200:
-            logging.info("Job successfully retrieved from worker.")
-            return response.json()
-        elif response.status_code == 404:
-            logging.info("Worker reported no jobs in the queue.")
-            return None
-        else:
-            logging.error(f"Error fetching job: {response.status_code} - {response.text}")
-            return None
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Could not connect to worker to get job: {e}")
-        return None
-
-def process_job(update_json):
-    """
-    This function replaces all the old telebot handlers.
-    It takes the raw Telegram update and processes it sequentially.
-    """
-    # Use the library's utility to convert the JSON into a familiar Message object.
-    message = types.Message.de_json(update_json.get('message'))
-    if not message:
-        logging.error("Job data did not contain a valid 'message' object.")
-        return
-
-    chat_id = message.chat.id
-
-    # --- Step 1: Check for valid media and caption ---
-    # In this new workflow, the user MUST send the media and caption in a single message.
-    if not (message.photo or message.video) or not message.caption:
-        error_text = "❌ This bot now requires you to send the media (image/video) and the caption text together in a single message. Please try again."
-        bot.send_message(chat_id, error_text)
-        logging.warning(f"Invalid job for chat {chat_id}: Missing media or caption.")
-        return # The main() function's finally block will handle shutdown.
-
-    processing_message = bot.send_message(chat_id, "⬇️ Media detected. Processing...")
-
-    # --- Step 2: Download the media ---
-    try:
-        if message.photo:
-            file_id = message.photo[-1].file_id
-            media_type = 'image'
-        else: # video
-            file_id = message.video.file_id
-            media_type = 'video'
-
-        file_info = bot.get_file(file_id)
-        file_extension = os.path.splitext(file_info.file_path)[1]
-        media_path = os.path.join(DOWNLOAD_PATH, f"{chat_id}_{file_id}{file_extension}")
-
-        file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_info.file_path}"
-        with requests.get(file_url, stream=True) as r:
-            r.raise_for_status()
-            with open(media_path, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
-        logging.info(f"Media downloaded to {media_path}")
-    except Exception as e:
-        bot.edit_message_text("❌ An error occurred while downloading your media.", chat_id, processing_message.message_id)
-        logging.error(f"Error downloading media for chat {chat_id}: {e}", exc_info=True)
-        return
-
-    # --- Step 3: Set parameters and start video processing ---
-    caption_text = message.caption
-    # Since we can't ask interactively, we default fade to True unless a hashtag is present.
-    apply_fade = '#nofade' not in caption_text.lower()
-    
-    bot.edit_message_text(f"⚙️ Media received. Creating your video... (Fade-in: {'Yes' if apply_fade else 'No'})", chat_id, processing_message.message_id)
-
-    # The video processing task is already well-suited for this.
-    isolated_video_processing_task(
-        chat_id,
-        media_path,
-        media_type,
-        caption_text,
-        apply_fade,
-        processing_message.message_id
-    )
 
 # --- Background Cleanup Thread ---
 
@@ -404,20 +342,22 @@ def handle_other_messages(message):
 # --- Isolated Processing and Upload Functions ---
 
 def upload_and_process(chat_id, video_path, frame_path):
-    # This function remains unchanged
+    """Uploads video and a frame to the worker for further processing."""
     worker_url = f"{WORKER_PUBLIC_URL}/process"
     try:
         with open(frame_path, "rb") as image_file, open(video_path, 'rb') as video_file:
             image_data = base64.b64encode(image_file.read()).decode('utf-8')
-            files = {'video': ('final_video.mp4', video_file, 'video/mp4'), 'image_data': (None, image_data), 'chat_id': (None, str(chat_id))}
+            files = {
+                'video': ('final_video.mp4', video_file, 'video/mp4'),
+                'image_data': (None, image_data),
+                'chat_id': (None, str(chat_id))
+            }
             response = requests.post(worker_url, files=files, timeout=60)
             response.raise_for_status()
         return True
     except requests.exceptions.RequestException as e:
         logging.error(f"Error uploading to worker for chat {chat_id}: {e}")
         return False
-
-
 
 def isolated_video_processing_task(chat_id, media_path, media_type, caption_text, apply_fade, message_id):
     """A self-contained function to run in a separate process."""
@@ -519,32 +459,22 @@ def isolated_video_processing_task(chat_id, media_path, media_type, caption_text
         logging.error(f"Error in isolated process for chat {chat_id}: {e}", exc_info=True)
         send_bot_message("An unexpected server error occurred. Please try again.")
     finally:
-        # This process ONLY cleans up its own files. It does NOT stop the deployment.
         cleanup_files(files_to_clean)
-        logging.info(f"Finished video processing task for chat {chat_id}.")
+        restart_railway_deployment() # <--- RESTART BOT
 
-def main():
-    """The main entry point for the bot script."""
-    logging.info("Bot started in single-job execution mode.")
-    create_directories()
-
-    try:
-        job_data = get_job_from_worker()
-        if job_data:
-            # If a job was found, process it.
-            process_job(job_data)
-        else:
-            # If no job was found, there's nothing to do.
-            logging.info("No job to process. Shutting down.")
-    except Exception as e:
-        logging.critical(f"A top-level unhandled exception occurred: {e}", exc_info=True)
-    finally:
-        # This block is CRITICAL. It ensures that whether the job succeeded, failed,
-        # or if there was no job at all, we always reset the worker and stop the deployment.
-        logging.info("Execution finished. Preparing to shut down.")
-        stop_railway_deployment()
-        sys.exit(0)
-
-
+# --- Main Bot Loop ---
 if __name__ == '__main__':
-    main()
+    logging.info("Starting bot...")
+    create_directories()
+    
+    # Start the background thread for cleaning up stale sessions
+    cleanup_thread = threading.Thread(target=cleanup_stale_sessions, daemon=True)
+    cleanup_thread.start()
+    
+    while True:
+        try:
+            logging.info("Bot is polling for messages...")
+            bot.polling(none_stop=True)
+        except Exception as e:
+            logging.error(f"Bot polling loop crashed: {e}", exc_info=True)
+            time.sleep(15)
