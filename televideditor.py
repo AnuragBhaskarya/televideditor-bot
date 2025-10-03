@@ -137,15 +137,19 @@ def stop_railway_deployment():
             logging.error(f"Response from Railway: {response.text}")
 # --- Worker Communication Functions ---
 
+# In televideditor.py
+
 def fetch_job_from_redis():
     """Fetches a single job from the Upstash Redis queue endpoint."""
     # RPOP atomically reads and removes the last element from the list.
-    url = f"{UPSTASH_REDIS_REST_URL}/rpop/job_queue"
+    url = f"{UPstash_REDIS_REST_URL}/rpop/job_queue"
     headers = {
         "Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"
     }
-    try {
-        response = requests.get(url, headers=headers, timeout=5) # 5s timeout is plenty
+
+    # --- THIS IS THE CORRECTED BLOCK ---
+    try:
+        response = requests.get(url, headers=headers, timeout=5)  # 5s timeout is plenty
         response.raise_for_status()
         
         data = response.json()
@@ -153,14 +157,19 @@ def fetch_job_from_redis():
 
         if result:
             logging.info("Successfully fetched a new job from Redis.")
-            # The result is a string, so we need to parse it back into a JSON object
+            # The result is a JSON string, so we need to parse it back into a Python dictionary
             return json.loads(result)
         else:
-            # If the list is empty, Upstash returns a null result
+            # If the list is empty, Upstash returns a null result, so we return None.
+            logging.info("Job queue in Redis is empty.")
             return None
 
     except requests.exceptions.RequestException as e:
         logging.error(f"Could not connect to Redis to fetch job: {e}")
+        return None
+    except json.JSONDecodeError as e:
+        logging.error(f"Failed to decode JSON from Redis response: {e}")
+        logging.error(f"Raw response from Redis: {response.text if 'response' in locals() else 'No response'}")
         return None
 
 def submit_result_to_worker(chat_id, video_path, frame_path):
