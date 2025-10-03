@@ -352,22 +352,50 @@ def process_video_job(job_data):
         cleanup_files(files_to_clean)
 
 
+# In televideditor.py
+
 # --- Main Bot Loop ---
 if __name__ == '__main__':
     logging.info("Starting Python Job Processor...")
     create_directories()
     
-    while True:
+    start_time = time.time()
+    timeout_seconds = 60  # Wait a maximum of 60 seconds for the first job
+    first_job = None
+
+    # --- Polling Loop with Timeout ---
+    # This loop runs for up to 60 seconds, waiting for the user to finish their choices.
+    logging.info(f"Pre-warmed. Polling for first job for up to {timeout_seconds} seconds...")
+    while time.time() - start_time < timeout_seconds:
         job = fetch_job_from_worker()
-        
         if job:
-            # If we found a job, process it
-            process_video_job(job)
-        else:
-            # If the queue is empty (job is None), shut down
-            logging.info("No more jobs in the queue. Shutting down.")
-            stop_railway_deployment()
-            break # Exit the loop
-            
+            logging.info("First job found in queue. Starting processing.")
+            first_job = job
+            break  # Exit the polling loop
+        
+        # Wait for 1 second before polling again
+        time.sleep(1)
+    
+    # --- Processing Phase ---
+    if first_job:
+        # If we found a job, process it and then continue to process any other jobs in the queue.
+        process_video_job(first_job)
+        
+        # Now, process the rest of the queue without a timeout
+        while True:
+            job = fetch_job_from_worker()
+            if job:
+                process_video_job(job)
+            else:
+                # The queue is now empty
+                logging.info("Job queue is empty.")
+                break # Exit the queue-processing loop
+    else:
+        # If the polling loop finished without finding any job, it means the user abandoned the process.
+        logging.warning(f"No job found within the {timeout_seconds} second timeout. Shutting down to conserve resources.")
+
+    # --- Shutdown Phase ---
+    # This code runs whether we processed jobs or timed out.
+    logging.info("All tasks complete or timed out. Requesting shutdown.")
+    stop_railway_deployment()
     logging.info("Processor has finished its work and is exiting.")
-    # The script will naturally exit after the loop breaks.
