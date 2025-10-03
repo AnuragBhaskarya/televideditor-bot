@@ -19,6 +19,9 @@ BOT_TOKEN_2 = os.environ.get("BOT_TOKEN")
 WORKER_PUBLIC_URL = os.environ.get("WORKER_PUBLIC_URL")
 RAILWAY_API_TOKEN = os.environ.get("RAILWAY_API_TOKEN") # <-- Add this
 RAILWAY_SERVICE_ID = os.environ.get("RAILWAY_SERVICE_ID") # <-- Add this
+# Add these to your Constants section
+UPSTASH_REDIS_REST_URL = os.environ.get("UPSTASH_REDIS_REST_URL")
+UPSTASH_REDIS_REST_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
 
 if not all([BOT_TOKEN_2, WORKER_PUBLIC_URL, RAILWAY_API_TOKEN, RAILWAY_SERVICE_ID]):
     raise ValueError("BOT_TOKEN_2, WORKER_PUBLIC_URL, RAILWAY_API_TOKEN, and RAILWAY_SERVICE_ID environment variables must be set!")
@@ -134,22 +137,30 @@ def stop_railway_deployment():
             logging.error(f"Response from Railway: {response.text}")
 # --- Worker Communication Functions ---
 
-def fetch_job_from_worker():
-    """Fetches a single job from the worker's queue endpoint."""
-    url = f"{WORKER_PUBLIC_URL}/get-job"
-    try:
-        response = requests.get(url, timeout=15)
-        if response.status_code == 200:
-            logging.info("Successfully fetched a new job.")
-            return response.json()
-        elif response.status_code == 404:
-            logging.info("Job queue is empty.")
-            return None
+def fetch_job_from_redis():
+    """Fetches a single job from the Upstash Redis queue endpoint."""
+    # RPOP atomically reads and removes the last element from the list.
+    url = f"{UPSTASH_REDIS_REST_URL}/rpop/job_queue"
+    headers = {
+        "Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"
+    }
+    try {
+        response = requests.get(url, headers=headers, timeout=5) # 5s timeout is plenty
+        response.raise_for_status()
+        
+        data = response.json()
+        result = data.get("result")
+
+        if result:
+            logging.info("Successfully fetched a new job from Redis.")
+            # The result is a string, so we need to parse it back into a JSON object
+            return json.loads(result)
         else:
-            logging.error(f"Error fetching job. Status: {response.status_code}, Body: {response.text}")
+            # If the list is empty, Upstash returns a null result
             return None
+
     except requests.exceptions.RequestException as e:
-        logging.error(f"Could not connect to worker to fetch job: {e}")
+        logging.error(f"Could not connect to Redis to fetch job: {e}")
         return None
 
 def submit_result_to_worker(chat_id, video_path, frame_path):
@@ -367,7 +378,7 @@ if __name__ == '__main__':
     # This loop runs for up to 60 seconds, waiting for the user to finish their choices.
     logging.info(f"Pre-warmed. Polling for first job for up to {timeout_seconds} seconds...")
     while time.time() - start_time < timeout_seconds:
-        job = fetch_job_from_worker()
+        job = fetch_job_from_redis()
         if job:
             logging.info("First job found in queue. Starting processing.")
             first_job = job
@@ -383,7 +394,7 @@ if __name__ == '__main__':
         
         # Now, process the rest of the queue without a timeout
         while True:
-            job = fetch_job_from_worker()
+            job = fetch_job_from_redis()
             if job:
                 process_video_job(job)
             else:
