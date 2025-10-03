@@ -142,7 +142,7 @@ def stop_railway_deployment():
 def fetch_job_from_redis():
     """Fetches a single job from the Upstash Redis queue endpoint."""
     # RPOP atomically reads and removes the last element from the list.
-    url = f"{UPstash_REDIS_REST_URL}/rpop/job_queue"
+    url = f"{UPSTASH_REDIS_REST_URL}/rpop/job_queue"
     headers = {
         "Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"
     }
