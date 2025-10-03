@@ -73,19 +73,34 @@ def create_directories():
         if not os.path.exists(path):
             os.makedirs(path)
             
-# --- restart itself ---
+# --- stop itself ---
 
-def restart_railway_deployment():
+def stop_railway_deployment():
     """
-    Restarts the Railway deployment by fetching the latest deployment ID
-    and using the Railway GraphQL API to trigger a restart.
+    Notifies the worker to start listening again and then stops the Railway deployment.
     """
-    logging.info("Attempting to restart Railway deployment...")
+    # --- MODIFIED PART: Notify the worker to reset its state before stopping ---
+    reset_url = f"{WORKER_PUBLIC_URL}/reset"
+    logging.info(f"Sending GET request to worker reset endpoint: {reset_url}")
+    try:
+        # Send a GET request with a short timeout.
+        # We don't need to process the response, just ensure it's sent.
+        response = requests.get(reset_url, timeout=10)
+        if response.status_code == 200:
+            logging.info("Successfully notified worker to reset.")
+        else:
+            logging.warning(f"Worker reset endpoint returned status {response.status_code}: {response.text}")
+    except requests.exceptions.RequestException as e:
+        # Log the error but continue, as stopping the deployment is more critical.
+        logging.error(f"Failed to send reset signal to worker: {e}")
+    # --- END OF MODIFICATION ---
+
+    logging.info("Attempting to stop Railway deployment...")
     api_token = os.environ.get("RAILWAY_API_TOKEN")
     service_id = os.environ.get("RAILWAY_SERVICE_ID")
 
     if not api_token or not service_id:
-        logging.warning("RAILWAY_API_TOKEN or RAILWAY_SERVICE_ID is not set. Skipping restart.")
+        logging.warning("RAILWAY_API_TOKEN or RAILWAY_SERVICE_ID is not set. Skipping stop.")
         return
 
     graphql_url = "https://backboard.railway.app/graphql/v2"
@@ -123,23 +138,23 @@ def restart_railway_deployment():
         logging.error(f"Response from Railway: {response.text if 'response' in locals() else 'No response'}")
         return # Stop if we can't get the ID
 
-    # Step 2: Trigger the restart using the deployment ID
-    restart_mutation = {
+    # Step 2: Trigger the stop using the deployment ID
+    stop_mutation = {
         "query": """
-            mutation deploymentRestart($id: String!) {
-                deploymentRestart(id: $id)
+            mutation deploymentStop($id: String!) {
+                deploymentStop(id: $id)
             }
         """,
         "variables": {"id": deployment_id}
     }
 
     try:
-        response = requests.post(graphql_url, json=restart_mutation, headers=headers, timeout=15)
+        response = requests.post(graphql_url, json=stop_mutation, headers=headers, timeout=15)
         response.raise_for_status()
-        logging.info("Successfully sent restart command to Railway.")
+        logging.info("Successfully sent stop command to Railway.")
 
     except requests.exceptions.RequestException as e:
-        logging.error(f"Failed to send restart command to Railway: {e}")
+        logging.error(f"Failed to send stop command to Railway: {e}")
         logging.error(f"Response from Railway: {response.text if 'response' in locals() else 'No response'}")
         
 
@@ -460,7 +475,7 @@ def isolated_video_processing_task(chat_id, media_path, media_type, caption_text
         send_bot_message("An unexpected server error occurred. Please try again.")
     finally:
         cleanup_files(files_to_clean)
-        restart_railway_deployment() # <--- RESTART BOT
+        stop_railway_deployment() # <--- NOTIFIES WORKER AND THEN STOPS BOT
 
 # --- Main Bot Loop ---
 if __name__ == '__main__':
