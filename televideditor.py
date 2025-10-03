@@ -159,6 +159,11 @@ def submit_result_to_worker(chat_id, video_path, frame_path):
     try:
         with open(frame_path, "rb") as image_file, open(video_path, 'rb') as video_file:
             image_data = base64.b64encode(image_file.read()).decode('utf-8')
+            
+            # <-- NEW DEBUG LOG
+            # This confirms that the frame data is not empty before sending.
+            logging.info(f"Frame data prepared for upload. Size: {len(image_data)} characters.")
+
             files = {
                 'video': ('final_video.mp4', video_file, 'video/mp4'),
                 'image_data': (None, image_data),
@@ -170,6 +175,8 @@ def submit_result_to_worker(chat_id, video_path, frame_path):
         return True
     except requests.exceptions.RequestException as e:
         logging.error(f"Error uploading result to worker: {e}")
+        if 'response' in locals():
+            logging.error(f"Worker response: {response.text}") # <-- MORE DETAIL ON ERROR
         return False
 
 # --- Core Processing Logic (Adapted from original script) ---
@@ -239,14 +246,19 @@ def create_caption_image(text, job_id):
     return caption_image_path, rect_height
 
 def extract_frame_from_video(video_path, duration, job_id):
-    # This function remains the same, but uses job_id for unique filenames
+    """Extract a frame from the midpoint of a video."""
     frame_path = os.path.join(OUTPUT_PATH, f"frame_{job_id}.jpg")
     midpoint = duration / 2
-    command = ['ffmpeg', '-y', '-i', video_path, '-ss', str(midpoint), '-vframes', '1', frame_path]
+    command = [
+        'ffmpeg', '-y', '-i', video_path, '-ss', str(midpoint),
+        '-vframes', '1', frame_path
+    ]
     try:
         subprocess.run(command, check=True, capture_output=True, text=True, timeout=30)
+        # <-- NEW DEBUG LOG
+        logging.info(f"Successfully extracted frame for job {job_id} to {frame_path}")
         return frame_path
-    except Exception as e:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         logging.error(f"FFmpeg frame extraction failed: {getattr(e, 'stderr', e)}")
         return None
 
