@@ -394,7 +394,7 @@ if __name__ == '__main__':
             break  # Exit the polling loop
         
         # Wait for 1 second before polling again
-        time.sleep(300)
+        time.sleep(3)
     
     # --- Processing Phase ---
     if first_job:
