@@ -172,31 +172,36 @@ def fetch_job_from_redis():
         logging.error(f"Raw response from Redis: {response.text if 'response' in locals() else 'No response'}")
         return None
 
-def submit_result_to_worker(chat_id, video_path, frame_path):
-    """Uploads the final video and a frame to the worker."""
+def submit_result_to_worker(chat_id, video_path, frame_path, messages_to_delete):
+    """Uploads the final video, a frame, and the list of message IDs to the worker."""
     url = f"{WORKER_PUBLIC_URL}/submit-result"
     logging.info(f"Submitting result for chat_id {chat_id} to worker...")
     try:
         with open(frame_path, "rb") as image_file, open(video_path, 'rb') as video_file:
             image_data = base64.b64encode(image_file.read()).decode('utf-8')
             
-            # <-- NEW DEBUG LOG
-            # This confirms that the frame data is not empty before sending.
             logging.info(f"Frame data prepared for upload. Size: {len(image_data)} characters.")
 
             files = {
                 'video': ('final_video.mp4', video_file, 'video/mp4'),
                 'image_data': (None, image_data),
-                'chat_id': (None, str(chat_id))
+                'chat_id': (None, str(chat_id)),
+                
+                # --- THIS IS THE REQUIRED CHANGE ---
+                # Add the list of message IDs, serialized as a JSON string.
+                'messages_to_delete': (None, json.dumps(messages_to_delete))
             }
+            
             response = requests.post(url, files=files, timeout=60)
             response.raise_for_status()
+            
         logging.info("Successfully submitted result to worker.")
         return True
+        
     except requests.exceptions.RequestException as e:
         logging.error(f"Error uploading result to worker: {e}")
         if 'response' in locals():
-            logging.error(f"Worker response: {response.text}") # <-- MORE DETAIL ON ERROR
+            logging.error(f"Worker response: {response.text}")
         return False
 
 # --- Core Processing Logic (Adapted from original script) ---
@@ -286,6 +291,10 @@ def process_video_job(job_data):
     """The main video creation logic for a single job."""
     chat_id = job_data['chat_id']
     job_id = job_data['job_id']
+    # --- THIS IS THE FIRST CHANGE ---
+    # Get the list of message IDs from the job data.
+    messages_to_delete = job_data.get("messages_to_delete", [])
+    
     logging.info(f"Starting processing for job_id: {job_id}")
 
     files_to_clean = []
@@ -309,6 +318,7 @@ def process_video_job(job_data):
         
         # 4. Run FFmpeg
         output_filepath = os.path.join(OUTPUT_PATH, f"output_{job_id}.mp4")
+        # ... (the entire FFmpeg command block remains unchanged) ...
         scale_ratio = COMP_WIDTH / media_w
         scaled_media_h = int(media_h * scale_ratio)
         media_y_pos = (COMP_HEIGHT / 2 - scaled_media_h / 2) + MEDIA_Y_OFFSET
@@ -359,12 +369,13 @@ def process_video_job(job_data):
             raise ValueError("Frame extraction failed.")
         files_to_clean.append(frame_path)
 
-        submit_result_to_worker(chat_id, output_filepath, frame_path)
+        # --- THIS IS THE SECOND CHANGE ---
+        # Pass the 'messages_to_delete' list when calling the submit function.
+        submit_result_to_worker(chat_id, output_filepath, frame_path, messages_to_delete)
 
     except Exception as e:
         error_snippet = str(e)[-1000:]
         logging.error(f"Failed to process job {job_id}: {error_snippet}", exc_info=True)
-        # In a real-world scenario, you might want to report this failure back to the worker.
     
     finally:
         # 6. Clean up all temporary files
