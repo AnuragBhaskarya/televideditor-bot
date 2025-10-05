@@ -350,7 +350,7 @@ def process_video_job(job_data):
         
         command.extend([
             '-filter_complex', filter_complex, *map_args,
-            '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
+            '-c:v', 'libx264', '-preset', 'superfast', '-tune', 'zerolatency',
             '-c:a', 'aac', '-b:a', '192k',
             '-r', str(FPS), '-pix_fmt', 'yuv420p',
             output_filepath
