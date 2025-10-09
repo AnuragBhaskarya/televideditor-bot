@@ -8,6 +8,7 @@ import subprocess
 import threading
 from PIL import Image, ImageDraw, ImageFont
 import textwrap
+# --- New imports for the keep-alive web server ---
 from flask import Flask
 from waitress import serve
 
@@ -50,7 +51,6 @@ DOWNLOAD_PATH = "downloads"
 OUTPUT_PATH = "outputs"
 
 # --- Helper Functions ---
-
 def cleanup_files(file_list):
     """Safely delete a list of files."""
     for file_path in file_list:
@@ -68,27 +68,20 @@ def create_directories():
             os.makedirs(path)
 
 # --- Railway API Functions ---
-
 def stop_railway_deployment():
     """Stops the Railway deployment using the GraphQL API."""
     logging.info("Attempting to stop Railway deployment...")
+    api_token = os.environ.get("RAILWAY_API_TOKEN")
+    service_id = os.environ.get("RAILWAY_SERVICE_ID")
+    if not api_token or not service_id:
+        logging.warning("RAILWAY_API_TOKEN or RAILWAY_SERVICE_ID is not set. Skipping stop command.")
+        return
     graphql_url = "https://backboard.railway.app/graphql/v2"
-    headers = {
-        "Authorization": f"Bearer {RAILWAY_API_TOKEN}",
-        "Content-Type": "application/json"
-    }
-
+    headers = {"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"}
     get_id_query = {
-        "query": """
-            query getLatestDeployment($serviceId: String!) {
-                service(id: $serviceId) {
-                    deployments(first: 1) { edges { node { id } } }
-                }
-            }
-        """,
-        "variables": {"serviceId": RAILWAY_SERVICE_ID}
+        "query": "query getLatestDeployment($serviceId: String!) { service(id: $serviceId) { deployments(first: 1) { edges { node { id } } } } }",
+        "variables": {"serviceId": service_id}
     }
-
     try:
         response = requests.post(graphql_url, json=get_id_query, headers=headers, timeout=15)
         response.raise_for_status()
@@ -97,12 +90,7 @@ def stop_railway_deployment():
     except (requests.exceptions.RequestException, KeyError, IndexError) as e:
         logging.error(f"Failed to get Railway deployment ID for shutdown: {e}")
         return
-
-    stop_mutation = {
-        "query": "mutation deploymentStop($id: String!) { deploymentStop(id: $id) }",
-        "variables": {"id": deployment_id}
-    }
-
+    stop_mutation = {"query": "mutation deploymentStop($id: String!) { deploymentStop(id: $id) }", "variables": {"id": deployment_id}}
     try:
         response = requests.post(graphql_url, json=stop_mutation, headers=headers, timeout=15)
         response.raise_for_status()
@@ -111,31 +99,26 @@ def stop_railway_deployment():
         logging.error(f"Failed to send stop command to Railway: {e}")
 
 # --- Worker Communication Functions ---
-
 def fetch_job_from_redis():
-    """Fetches a single job from the Upstash Redis queue."""
+    """Fetches a single job from the Upstash Redis queue endpoint."""
     url = f"{UPSTASH_REDIS_REST_URL}/rpop/job_queue"
     headers = {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}
     try:
         response = requests.get(url, headers=headers, timeout=5)
         response.raise_for_status()
-        data = response.json()
-        result = data.get("result")
+        result = response.json().get("result")
         if result:
             logging.info("Successfully fetched a new job from Redis.")
             return json.loads(result)
         else:
             logging.info("Job queue in Redis is empty.")
             return None
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Could not connect to Redis to fetch job: {e}")
-        return None
-    except json.JSONDecodeError as e:
-        logging.error(f"Failed to decode JSON from Redis: {e}")
+    except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
+        logging.error(f"Could not fetch or decode job from Redis: {e}")
         return None
 
 def submit_result_to_worker(chat_id, video_path, frame_path, messages_to_delete):
-    """Uploads the final video, a frame, and message IDs to the worker."""
+    """Uploads the final video, a frame, and the list of message IDs to the worker."""
     url = f"{WORKER_PUBLIC_URL}/submit-result"
     logging.info(f"Submitting result for chat_id {chat_id} to worker...")
     try:
@@ -156,12 +139,12 @@ def submit_result_to_worker(chat_id, video_path, frame_path, messages_to_delete)
         return False
 
 # --- Core Processing Logic ---
-
 def download_telegram_file(file_id, job_id):
     """Downloads a file from Telegram using a file_id."""
     try:
         file_info_url = f"https://api.telegram.org/bot{BOT_TOKEN_2}/getFile"
-        response = requests.get(file_info_url, params={'file_id': file_id}, timeout=15)
+        params = {'file_id': file_id}
+        response = requests.get(file_info_url, params=params, timeout=15)
         response.raise_for_status()
         file_path = response.json()['result']['file_path']
         file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN_2}/{file_path}"
@@ -222,35 +205,28 @@ def extract_frame_from_video(video_path, duration, job_id):
         return None
 
 def process_video_job(job_data):
-    """The main video creation logic for a single job."""
     chat_id = job_data['chat_id']
     job_id = job_data['job_id']
     messages_to_delete = job_data.get("messages_to_delete", [])
     logging.info(f"Starting processing for job_id: {job_id}")
-
     files_to_clean = []
     try:
         media_path = download_telegram_file(job_data['file_id'], job_id)
         if not media_path: raise ValueError("Media download failed.")
         files_to_clean.append(media_path)
-
         media_type = job_data['media_type']
         media_w, media_h, final_duration = get_media_dimensions(media_path, media_type)
         if not all([media_w, media_h, final_duration]): raise ValueError("Could not get media dimensions.")
-
         caption_image_path, caption_height = create_caption_image(job_data['caption_text'], job_id)
         files_to_clean.append(caption_image_path)
-        
         output_filepath = os.path.join(OUTPUT_PATH, f"output_{job_id}.mp4")
         scale_ratio = COMP_WIDTH / media_w
         scaled_media_h = int(media_h * scale_ratio)
         media_y_pos = (COMP_HEIGHT / 2 - scaled_media_h / 2) + MEDIA_Y_OFFSET
         caption_y_pos = media_y_pos - caption_height + 1
-
         command = ['ffmpeg', '-y', '-f', 'lavfi', '-i', f'color=c={BACKGROUND_COLOR}:s={COMP_SIZE_STR}:d={final_duration}']
         if media_type == 'image': command.extend(['-loop', '1', '-t', str(final_duration)])
         command.extend(['-i', media_path, '-i', caption_image_path])
-
         filter_parts = [f"[1:v]scale={COMP_WIDTH}:-1,setpts=PTS-STARTPTS[scaled_media]"]
         media_layer = "[scaled_media]"
         if job_data['apply_fade']:
@@ -259,7 +235,6 @@ def process_video_job(job_data):
                 f"[scaled_media][fade_layer]overlay=0:0[media_with_fade]"
             ])
             media_layer = "[media_with_fade]"
-
         filter_parts.extend([
             f"[0:v]{media_layer}overlay=(W-w)/2:{media_y_pos}[bg_with_media]",
             f"[bg_with_media][2:v]overlay=(W-w)/2:{caption_y_pos}[final_v]"
@@ -269,59 +244,53 @@ def process_video_job(job_data):
         if media_type == 'video':
             filter_complex += ";[1:a]asetpts=PTS-STARTPTS[final_a]"
             map_args.extend(['-map', '[final_a]'])
-        
-        command.extend(['-filter_complex', filter_complex, *map_args, '-c:v', 'libx264', '-preset', 'superfast', '-c:a', 'aac', '-b:a', '192k', '-r', str(FPS), '-pix_fmt', 'yuv420p', output_filepath])
-        
+        command.extend(['-filter_complex', filter_complex, *map_args, '-c:v', 'libx264', '-preset', 'superfast', '-tune', 'zerolatency', '-c:a', 'aac', '-b:a', '192k', '-r', str(FPS), '-pix_fmt', 'yuv420p', output_filepath])
         result = subprocess.run(command, capture_output=True, text=True, timeout=300)
         if result.returncode != 0: raise subprocess.CalledProcessError(result.returncode, command, stderr=result.stderr)
-        
         logging.info(f"FFmpeg processing finished for job {job_id}.")
         files_to_clean.append(output_filepath)
-
         frame_path = extract_frame_from_video(output_filepath, final_duration, job_id)
         if not frame_path: raise ValueError("Frame extraction failed.")
         files_to_clean.append(frame_path)
-
         submit_result_to_worker(chat_id, output_filepath, frame_path, messages_to_delete)
-
     except Exception as e:
-        logging.error(f"Failed to process job {job_id}: {str(e)[-1000:]}", exc_info=True)
+        error_snippet = str(e)[-1000:]
+        logging.error(f"Failed to process job {job_id}: {error_snippet}", exc_info=True)
     finally:
         logging.info(f"Cleaning up files for job {job_id}.")
         cleanup_files(files_to_clean)
 
-# --- Keep-Alive Web Server ---
+# --- Keep-Alive Web Server ("The Receptionist") ---
 app = Flask(__name__)
-
 @app.route('/')
 def keep_alive():
-    """Endpoint hit by the pinger to keep the service from sleeping."""
-    return "Televid Editor: Container is warm and ready for jobs.", 200
+    """Endpoint for the pinger to hit."""
+    return "Bot is awake.", 200
 
 def run_web_server():
     """Runs the Flask app on the port provided by Railway."""
     port = int(os.environ.get("PORT", 8080))
     serve(app, host='0.0.0.0', port=port)
 
-# --- Main Bot Logic ---
+# --- Final "Grace Period" Main Logic ---
 if __name__ == '__main__':
-    # Step 1: Always start the web server to handle any incoming pings.
+    # Step 1: Start the web server in a background thread.
     web_thread = threading.Thread(target=run_web_server, daemon=True)
     web_thread.start()
-    logging.info("Keep-alive web server started in a background thread.")
+    logging.info("Keep-alive web server started in background.")
 
-    # Step 2: Initialize and do ONE immediate check for a job.
-    logging.info("Starting Python Job Processor and checking for an initial job...")
+    # Step 2: Initialize and check for a job.
+    logging.info("Checking for an initial job...")
     create_directories()
     initial_job = fetch_job_from_redis()
 
     # Step 3: Decide what to do based on the check.
     if initial_job:
-        # --- PATH A: A REAL JOB IS WAITING ---
-        logging.info("Hot Start: Job found immediately. Starting processing.")
+        # --- PATH A: REAL JOB ---
+        logging.info("Hot Start: Job found. Starting processing.")
         process_video_job(initial_job)
         
-        # Continue processing any other jobs in the queue until it's empty.
+        # Process the rest of the queue.
         while True:
             job = fetch_job_from_redis()
             if job:
@@ -329,12 +298,19 @@ if __name__ == '__main__':
             else:
                 logging.info("Job queue is empty.")
                 break 
-    else:
-        # --- PATH B: NO JOB WAITING (LIKELY WOKEN BY PINGER) ---
-        logging.warning("Cold Start: No initial job found. Assuming woken by pinger.")
+        
+        # When all jobs are done, enter the grace period before shutting down.
+        logging.info("All tasks complete. Entering 70-second grace period before shutdown.")
+        time.sleep(70)
+        stop_railway_deployment()
 
-    # Step 4: Shut down.
-    # This runs after the queue is empty (if there were jobs) or immediately (if woken by ping).
-    logging.info("Tasks complete or no initial job found. Requesting shutdown.")
-    stop_railway_deployment()
+    else:
+        # --- PATH B: NO JOB WAITING (WOKEN BY PINGER) ---
+        logging.warning("Cold Start: No initial job found. Entering 70-second grace period for pinger.")
+        time.sleep(70)
+        
+        # Now that the ping has been answered, shut down.
+        logging.info("Ping handled or timed out. Requesting shutdown.")
+        stop_railway_deployment()
+
     logging.info("Processor has finished its work and is exiting.")
